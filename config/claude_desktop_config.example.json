@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "conector-salesforce": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "YOUR_SERVER_URL",
+        "8080",
+        "--static-oauth-client-info",
+        "{\"client_id\":\"YOUR_CONSUMER_KEY\"}",
+        "--host",
+        "localhost"
+      ]
+    }
+  }
+}
