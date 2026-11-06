@@ -13,9 +13,10 @@ if errorlevel 1 (
   echo   Node.js was not found.
   echo   Install Node.js LTS from https://nodejs.org and run this again.
   echo.
-  pause
+  if "%~1"=="" pause
   exit /b 1
 )
 
 node "%~dp0installer.js" %*
-if errorlevel 1 pause
+if errorlevel 1 if "%~1"=="" pause
+exit /b %errorlevel%

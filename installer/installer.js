@@ -10,6 +10,7 @@
 
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const net = require('net');
 const path = require('path');
 const readline = require('readline');
@@ -21,6 +22,8 @@ const APP = 'CLAUDE SALESFORCE BRIDGE';
 const WIDTH = 66;
 const DEFAULT_PORT = 8080;
 const TEST_TIMEOUT_MS = 180000;
+// mcp-remote args that change the hash of its login files (see loginFiles).
+const HASH_FLAGS = ['--resource', '--header', '--authorize-param', '--client-metadata-url', '--token-endpoint'];
 
 // ---------------------------------------------------------------- terminal UI
 
@@ -327,7 +330,11 @@ function parseServer(server) {
       clientId = JSON.parse(raw).client_id || '';
     } catch { /* shown as "not found" */ }
   }
-  return { url, port, portSet, clientId, infoFile };
+  const h = args.indexOf('--host');
+  const hostLocalhost = h >= 0 && args[h + 1] === 'localhost';
+  const hashFlags = HASH_FLAGS.filter((f) => args.includes(f));
+  const authDir = server && server.env && server.env.MCP_REMOTE_CONFIG_DIR ? String(server.env.MCP_REMOTE_CONFIG_DIR) : '';
+  return { url, port, portSet, clientId, infoFile, hostLocalhost, hashFlags, authDir };
 }
 
 // Updates URL, port and client id in an existing entry, keeping any other
@@ -657,12 +664,12 @@ function reviewWarnings(s, portBusy) {
   return w;
 }
 
-async function confirmClaudeClosed(crumbs) {
+async function confirmClaudeClosed(crumbs, continueLabel = 'Save anyway') {
   for (;;) {
     if (!claudeRunning()) return true;
     const i = await select(crumbs, 'What do you want to do?', [
       { label: 'Check again', hint: 'after closing Claude' },
-      { label: 'Save anyway' },
+      { label: continueLabel },
       { label: 'Cancel' },
     ], {
       subtitle: 'Claude is running',
@@ -922,7 +929,7 @@ async function removeFlow(crumbs, e) {
     },
   });
   if (r !== 1) return false;
-  if (!(await confirmClaudeClosed(crumbs))) return false;
+  if (!(await confirmClaudeClosed(crumbs, 'Continue anyway'))) return false;
 
   const res = removeEntries(chosen);
   envCache = undefined;
@@ -1017,8 +1024,15 @@ function failureHints(log, port) {
   return hints;
 }
 
-async function testConnection(crumbs, cfg) {
+// With a "report" object it runs without the screen (command line mode): prints
+// nothing to stdout, does not wait for keys, and fills report with the result.
+async function testConnection(crumbs, cfg, report) {
+  const batch = !!report;
   const cli = npxCliPath();
+  if (!cli && batch) {
+    Object.assign(report, { success: false, message: 'npx was not found next to Node.js.' });
+    return false;
+  }
   if (!cli) {
     header(crumbs, 'Sign in and test connection');
     fail('npx was not found next to Node.js. Reinstall Node.js LTS from https://nodejs.org.');
@@ -1027,7 +1041,7 @@ async function testConnection(crumbs, cfg) {
   // Entries saved without a port: mcp-remote picks it, so do not add one here.
   const portKnown = cfg.portSet !== false;
   const portText = portKnown ? cfg.port : '<port>';
-  if (portKnown && !(await portFree(cfg.port))) {
+  if (portKnown && !batch && !(await portFree(cfg.port))) {
     const i = await select(crumbs, 'What do you want to do?', [{ label: 'Try anyway' }, { label: 'Back' }], {
       subtitle: 'Sign in and test connection',
       body: () => {
@@ -1039,10 +1053,12 @@ async function testConnection(crumbs, cfg) {
     if (i !== 0) return false;
   }
 
-  header(crumbs, 'Sign in and test connection');
-  info('If you are not signed in yet, your browser opens the Salesforce login.');
-  info('Sign in there, then come back to this window.');
-  out('');
+  if (!batch) {
+    header(crumbs, 'Sign in and test connection');
+    info('If you are not signed in yet, your browser opens the Salesforce login.');
+    info('Sign in there, then come back to this window.');
+    out('');
+  }
 
   return new Promise((resolve) => {
     const args = [
@@ -1059,8 +1075,8 @@ async function testConnection(crumbs, cfg) {
     let authShown = false;
     let frame = 0;
 
-    const line = (fn) => { process.stdout.write('\r\x1b[K'); fn(); };
-    const spin = setInterval(() => {
+    const line = (fn) => { if (batch) return; process.stdout.write('\r\x1b[K'); fn(); };
+    const spin = batch ? null : setInterval(() => {
       const secs = Math.round((Date.now() - started) / 1000);
       process.stdout.write('\r\x1b[K' + paint(c.cyan, `  [${'|/-\\'[frame++ % 4]}] `) + `Waiting for Salesforce... ${secs}s  ` + paint(c.dim, '(Esc to cancel)'));
     }, 120);
@@ -1070,16 +1086,23 @@ async function testConnection(crumbs, cfg) {
       if (key.ctrl && key.name === 'c') { killTree(child); exitNow(); }
       if (key.name === 'escape') finish(false, 'Cancelled.', true);
     };
-    readline.emitKeypressEvents(process.stdin);
-    setRaw(true);
-    process.stdin.resume();
-    process.stdin.on('keypress', onKey);
+    if (!batch) {
+      readline.emitKeypressEvents(process.stdin);
+      setRaw(true);
+      process.stdin.resume();
+      process.stdin.on('keypress', onKey);
+    }
 
     async function finish(success, message, quiet = false) {
       if (finished) return;
       finished = true;
       clearInterval(spin);
       clearTimeout(timer);
+      if (batch) {
+        killTree(child);
+        Object.assign(report, { success, message, hints: success ? [] : failureHints(log, portText) });
+        return resolve(success);
+      }
       process.stdin.removeListener('keypress', onKey);
       setRaw(false);
       process.stdin.pause();
@@ -1122,12 +1145,14 @@ async function testConnection(crumbs, cfg) {
         if (msg.id === 1) {
           if (msg.error) return finish(false, `Server rejected the connection: ${msg.error.message}`);
           const server = msg.result && msg.result.serverInfo ? msg.result.serverInfo.name : 'server';
+          if (batch) report.server = server;
           line(() => ok(`Signed in and connected to ${server}.`));
           send({ jsonrpc: '2.0', method: 'notifications/initialized' });
           send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
         } else if (msg.id === 2) {
           if (msg.error) return finish(false, `Could not list tools: ${msg.error.message}`);
           const tools = (msg.result && msg.result.tools) || [];
+          if (batch) report.tools = tools.map((t) => t.name);
           line(() => ok(`${tools.length} tool(s) available:`));
           tools.slice(0, 15).forEach((t) => info(paint(c.dim, `  - ${t.name}`)));
           if (tools.length > 15) info(paint(c.dim, `  ...and ${tools.length - 15} more`));
@@ -1147,6 +1172,8 @@ async function testConnection(crumbs, cfg) {
         const url = l.match(/https:\/\/\S+\/authorize\S*/i);
         if (url && !authShown) {
           authShown = true;
+          // The authorize URL carries the Consumer Key, so it is not printed here.
+          if (batch) process.stderr.write('Sign in to Salesforce in the browser window that opened...\n');
           line(() => {
             warn('Sign in in the browser. If it did not open, copy this URL:');
             info(paint(c.dim, url[0]));
@@ -1168,9 +1195,337 @@ async function testConnection(crumbs, cfg) {
   });
 }
 
+// ---------------------------------------------------------------- command line
+
+const USAGE = [
+  `Claude Salesforce Bridge installer v${VERSION}`,
+  '',
+  'Without options it opens the interactive menu. Options:',
+  '  --list [--json]                       List salesforce-conector-* connections',
+  '  --check <name> [--test] [--json]      Check a connection. --test also signs in',
+  '                                        (may open the browser) and lists the tools',
+  '  --remove <name> --from code|desktop|all --yes [--json]',
+  '                                        Remove a connection (backup .bak first).',
+  '                                        --from is required with --yes; code and',
+  '                                        all include every Claude Code project',
+  '  --clear-login <name> --yes [--json]   Move the saved login of a connection to',
+  '                                        a backup folder inside .mcp-auth',
+  '  --version, --help',
+  '',
+  'Without --yes, --remove and --clear-login only show what they would do',
+  'and exit with code 2 (nothing is changed).',
+  'Exit codes: 0 ok, 1 problem found or action failed, 2 usage error.',
+].join('\n');
+
+// mcp-remote keeps the login in <base>\mcp-remote-<version>\<hash>_*.json, where
+// <hash> is the md5 of the Server URL as written in the args (other parts only
+// with HASH_FLAGS, which are not supported here) and <base> is
+// MCP_REMOTE_CONFIG_DIR or %USERPROFILE%\.mcp-auth.
+function loginFiles(e) {
+  const base = e.authDir || process.env.MCP_REMOTE_CONFIG_DIR || path.join(os.homedir(), '.mcp-auth');
+  const r = { base, supported: false, reason: '', hash: '', files: [], saved: false };
+  if (!e.url) { r.reason = 'Server URL not found in args.'; return r; }
+  if (e.hashFlags.length) { r.reason = `Uses ${e.hashFlags.join(', ')}: its login files cannot be identified safely.`; return r; }
+  r.supported = true;
+  r.hash = crypto.createHash('md5').update(e.url).digest('hex');
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(base, { withFileTypes: true }).filter((d) => d.isDirectory() && d.name.startsWith('mcp-remote-'));
+  } catch { /* no login saved yet */ }
+  for (const d of dirs) {
+    let names = [];
+    try { names = fs.readdirSync(path.join(base, d.name)); } catch { /* unreadable */ }
+    for (const f of names) if (f.startsWith(`${r.hash}_`)) r.files.push(path.join(base, d.name, f));
+  }
+  r.saved = r.files.some((f) => f.endsWith('_tokens.json'));
+  return r;
+}
+
+function entryJson(e) {
+  const login = loginFiles(e);
+  return {
+    name: e.name, client: e.client, scope: e.scope, file: e.file, url: e.url || null,
+    port: e.portSet ? e.port : null, portSet: e.portSet, hostLocalhost: e.hostLocalhost,
+    clientIdFound: !!e.clientId,
+    login: { supported: login.supported, saved: login.supported ? login.saved : null },
+  };
+}
+
+function parseCli(argv) {
+  const o = { cmd: null, name: null, json: false, yes: false, test: false, from: null };
+  const cmds = ['--help', '--version', '--list', '--check', '--remove', '--clear-login'];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (cmds.includes(a)) {
+      if (o.cmd) throw new Error('Use only one command at a time.');
+      o.cmd = a.slice(2);
+      if (['check', 'remove', 'clear-login'].includes(o.cmd)) {
+        o.name = argv[++i];
+        if (!o.name || o.name.startsWith('--')) throw new Error(`${a} needs a connection name.`);
+      }
+    } else if (a === '--json') o.json = true;
+    else if (a === '--yes') o.yes = true;
+    else if (a === '--test') o.test = true;
+    else if (a === '--from') o.from = argv[++i];
+    else throw new Error(`Unknown option: ${a}`);
+  }
+  if (!o.cmd) throw new Error('Missing command.');
+  if (o.test && o.cmd !== 'check') throw new Error('--test works only with --check.');
+  if (o.from !== null && o.cmd !== 'remove') throw new Error('--from works only with --remove.');
+  if (o.from !== null && !['code', 'desktop', 'all'].includes(o.from)) throw new Error('--from must be code, desktop or all.');
+  if (o.cmd === 'remove' && o.yes && o.from === null) {
+    throw new Error('--remove with --yes needs --from code, desktop or all (code and all include every Claude Code project).');
+  }
+  if (o.name !== null) {
+    const n = FIELDS.name.normalize(o.name);
+    if (FIELDS.name.validate(n)) throw new Error(`Invalid connection name: ${o.name}`);
+    o.name = PREFIX + n;
+  }
+  return o;
+}
+
+async function cliList(o) {
+  const { found, errors } = findInstallations();
+  const connections = found.map(entryJson);
+  if (o.json) {
+    console.log(JSON.stringify({ version: VERSION, ok: !errors.length, connections, errors }, null, 2));
+  } else {
+    errors.forEach(fail);
+    if (!connections.length) warn('No connections found.');
+    connections.forEach((x) => {
+      out(`  ${x.name}  ${x.client}${x.scope ? ` (project ${x.scope})` : ''}`);
+      row('  Config file', x.file);
+      row('  Server URL', x.url || '(not found in args)');
+      row('  Port', x.portSet ? String(x.port) : '(not set; mcp-remote picks it)');
+      row('  Host', x.hostLocalhost ? '--host localhost' : '(--host localhost missing)');
+      row('  Login', !x.login.supported ? '(cannot be checked)' : x.login.saved ? 'saved' : 'not saved');
+      out('');
+    });
+  }
+  return errors.length ? 1 : 0;
+}
+
+async function cliCheck(o) {
+  const { found, errors } = findInstallations();
+  const places = found.filter((e) => e.name === o.name);
+  const add = (list, level, id, message) => list.push({ id, level, message });
+  const checks = [];
+  const major = Number(process.versions.node.split('.')[0]);
+  add(checks, major >= 18 ? 'ok' : 'error', 'node', `Node.js v${process.versions.node}${major >= 18 ? '' : ' (18 or newer is required)'}`);
+  add(checks, npxCliPath() ? 'ok' : 'error', 'npx', npxCliPath() ? 'npx found' : 'npx not found next to Node.js');
+  errors.forEach((m) => add(checks, 'warn', 'config', m));
+  if (!places.length) add(checks, 'error', 'entry', `${o.name} was not found.`);
+
+  const result = { version: VERSION, name: o.name, ok: true, checks, places: [] };
+  for (const p of places) {
+    const pc = [];
+    const urlErr = p.url ? FIELDS.url.validate(p.url) : 'Server URL not found in args.';
+    add(pc, urlErr ? 'error' : 'ok', 'url', urlErr || `Server URL ${p.url}`);
+    add(pc, p.clientId ? 'ok' : 'error', 'clientId', p.clientId ? 'Consumer Key found' : 'Consumer Key not found');
+    add(pc, p.hostLocalhost ? 'ok' : 'error', 'host', p.hostLocalhost ? '--host localhost present' : '--host localhost missing (needed on Windows)');
+    if (!p.portSet) {
+      add(pc, 'warn', 'port', 'Port not set; mcp-remote picks a port from the server URL');
+    } else {
+      const portErr = FIELDS.port.validate(String(p.port));
+      add(pc, portErr ? 'error' : 'ok', 'port', portErr || `Callback URL http://localhost:${p.port}/oauth/callback`);
+      if (!portErr) {
+        const free = await Promise.race([portFree(p.port), new Promise((r) => setTimeout(r, 500, true))]);
+        add(pc, free ? 'ok' : 'warn', 'portFree', free ? `Port ${p.port} is free` : `Port ${p.port} is in use (often by Claude or an old mcp-remote)`);
+      }
+    }
+    const login = loginFiles(p);
+    add(pc, login.supported && login.saved ? 'ok' : 'warn', 'login',
+      !login.supported ? login.reason : login.saved ? 'Login saved' : 'No saved login (sign in with --test or from Claude)');
+    result.places.push({ client: p.client, scope: p.scope, file: p.file, checks: pc });
+  }
+
+  if (o.test) {
+    const p = places.find((x) => x.url && x.clientId);
+    if (!p) add(checks, 'error', 'test', 'Nothing to test: no entry with Server URL and Consumer Key.');
+    else if (p.hashFlags.length || p.authDir) {
+      add(checks, 'warn', 'test', 'Test not supported for this entry (custom auth dir or extra mcp-remote flags).');
+    } else {
+      if (!o.json) info(`Testing ${p.client}${p.scope ? ` (project ${p.scope})` : ''}... the browser may open for the Salesforce login.`);
+      const report = {};
+      await testConnection([], p, report);
+      result.test = { client: p.client, scope: p.scope, file: p.file, success: !!report.success, message: report.message,
+        server: report.server || null, tools: report.tools || [], hints: report.hints || [] };
+    }
+  }
+
+  const all = checks.concat(...result.places.map((x) => x.checks));
+  result.ok = !all.some((x) => x.level === 'error') && (!result.test || result.test.success);
+  if (o.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    const show = (x) => (x.level === 'ok' ? ok : x.level === 'warn' ? warn : fail)(x.message);
+    checks.forEach(show);
+    result.places.forEach((x) => {
+      out('');
+      out(`  ${o.name}  ${x.client}${x.scope ? ` (project ${x.scope})` : ''}`);
+      info(paint(c.dim, x.file));
+      x.checks.forEach(show);
+    });
+    if (result.test) {
+      out('');
+      (result.test.success ? ok : fail)(result.test.message || 'Test failed.');
+      if (result.test.server) info(`Server: ${result.test.server}`);
+      result.test.tools.forEach((t) => info(paint(c.dim, `  - ${t}`)));
+      result.test.hints.forEach(warn);
+    }
+    out('');
+    (result.ok ? ok : fail)(result.ok ? 'No problems found.' : 'Problems found.');
+  }
+  return result.ok ? 0 : 1;
+}
+
+async function cliRemove(o) {
+  const from = o.from || 'all';
+  const { found } = findInstallations();
+  const places = found.filter((e) => e.name === o.name
+    && (from === 'all' || (from === 'code') === (e.client === 'Claude Code')));
+  const warnings = [];
+  if (claudeRunning()) warnings.push('Claude seems to be open. It rewrites its config files and may undo this change. Restart Claude afterwards.');
+  [...new Set(places.map((x) => x.infoFile).filter(Boolean))]
+    .forEach((f) => warnings.push(`Client info file kept (not created by this installer): ${f}`));
+  const where = places.map((x) => ({ client: x.client, scope: x.scope, file: x.file }));
+  let result;
+  let code;
+  if (!places.length) {
+    result = { ok: false, error: `${o.name} was not found${from === 'all' ? '' : ` in ${from}`}.` };
+    code = 1;
+  } else if (!o.yes) {
+    result = { ok: false, dryRun: true, wouldRemove: where, error: 'Nothing was removed. Add --yes to remove.' };
+    code = 2;
+  } else {
+    const res = removeEntries(places);
+    envCache = undefined;
+    result = {
+      ok: res.ok,
+      removed: res.removed.map((x) => ({ client: x.entry.client, scope: x.entry.scope, file: x.entry.file, backup: x.backup })),
+      error: res.ok ? null : `${res.error.entry.client}: ${res.error.message}`,
+      notUndone: res.notUndone, keptBackups: res.kept,
+    };
+    code = res.ok ? 0 : 1;
+  }
+  result = { version: VERSION, name: o.name, ...result, warnings };
+  if (o.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    (result.wouldRemove || []).forEach((x) => info(`Would remove from ${x.client}${x.scope ? ` (project ${x.scope})` : ''}: ${x.file}`));
+    (result.removed || []).forEach((x) => {
+      ok(`Removed from ${x.client}${x.scope ? ` (project ${x.scope})` : ''}: ${x.file}`);
+      if (x.backup) info(paint(c.dim, `Backup: ${x.backup}`));
+    });
+    if (result.error) fail(result.error);
+    (result.notUndone || []).forEach((w) => fail(`Could not undo the change in ${w.file}${w.backup ? `. Restore it from ${w.backup}` : ''}`));
+    (result.keptBackups || []).forEach((b) => info(paint(c.dim, `Backup kept: ${b}`)));
+    warnings.forEach(warn);
+  }
+  return code;
+}
+
+async function cliClearLogin(o) {
+  const { found } = findInstallations();
+  const places = found.filter((e) => e.name === o.name);
+  const warnings = [];
+  let result;
+  let code = 0;
+  const logins = places.map(loginFiles);
+  const bad = logins.find((l) => !l.supported);
+  if (!places.length) {
+    result = { ok: false, error: `${o.name} was not found.` };
+    code = 1;
+  } else if (bad) {
+    result = { ok: false, error: `Login files not changed. ${bad.reason}` };
+    code = 1;
+  } else {
+    const files = [...new Set([].concat(...logins.map((l) => l.files)))];
+    const keys = new Set(logins.map((l) => `${l.base}|${l.hash}`));
+    const shared = [...new Set(found.filter((e) => e.name !== o.name && e.url && !e.hashFlags.length)
+      .filter((e) => { const l = loginFiles(e); return keys.has(`${l.base}|${l.hash}`); })
+      .map((e) => e.name))];
+    if (shared.length) warnings.push(`Same Server URL, so the same login: ${shared.join(', ')} will need to sign in again too.`);
+    if (claudeRunning()) warnings.push('Claude seems to be open. Restart it so it does not keep using the old login.');
+    if (!files.length) {
+      result = { ok: true, moved: [], message: 'No saved login found.' };
+    } else if (!o.yes) {
+      result = { ok: false, dryRun: true, wouldMove: files, error: 'Nothing was moved. Add --yes to clear the login.' };
+      code = 2;
+    } else {
+      // Moved (not deleted) to <base>\backup-<date>\<mcp-remote folder>\, which mcp-remote does not read.
+      const moved = [];
+      const st = stamp();
+      const backupDir = {}; // one new backup folder per base, never an existing one
+      try {
+        for (const f of files) {
+          const base = logins.find((l) => l.files.includes(f)).base;
+          if (!backupDir[base]) {
+            let d = path.join(base, `backup-${st}`);
+            for (let n = 2; fs.existsSync(d); n++) d = path.join(base, `backup-${st}-${n}`);
+            backupDir[base] = d;
+          }
+          const to = path.join(backupDir[base], path.basename(path.dirname(f)), path.basename(f));
+          fs.mkdirSync(path.dirname(to), { recursive: true });
+          fs.renameSync(f, to);
+          moved.push({ from: f, to });
+        }
+        result = { ok: true, moved, message: 'Login cleared. The next connection asks you to sign in again.' };
+      } catch (e) {
+        const notUndone = [];
+        for (const m of moved.slice().reverse()) {
+          try { fs.renameSync(m.to, m.from); } catch { notUndone.push(m); }
+        }
+        result = { ok: false, moved: notUndone, error: `${e.message}${notUndone.length ? ' Some files could not be moved back (see moved).' : ' Nothing was changed.'}` };
+        code = 1;
+      }
+    }
+  }
+  result = { version: VERSION, name: o.name, ...result, warnings };
+  if (o.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    (result.wouldMove || []).forEach((f) => info(`Would move: ${f}`));
+    (result.moved || []).forEach((m) => info(`Moved: ${m.from}\n      to: ${m.to}`));
+    if (result.message) ok(result.message);
+    if (result.error) fail(result.error);
+    warnings.forEach(warn);
+  }
+  return code;
+}
+
+async function runCli(argv) {
+  let o;
+  try {
+    o = parseCli(argv);
+  } catch (e) {
+    if (argv.includes('--json')) console.log(JSON.stringify({ version: VERSION, ok: false, error: e.message }, null, 2));
+    else { console.error(e.message); console.error(''); console.error(USAGE); }
+    return 2;
+  }
+  try {
+    if (o.cmd === 'help') { console.log(USAGE); return 0; }
+    if (o.cmd === 'version') { console.log(VERSION); return 0; }
+    if (o.cmd === 'list') return await cliList(o);
+    if (o.cmd === 'check') return await cliCheck(o);
+    if (o.cmd === 'remove') return await cliRemove(o);
+    return await cliClearLogin(o);
+  } catch (e) {
+    const message = e && e.message ? e.message : String(e);
+    if (o.json) console.log(JSON.stringify({ version: VERSION, ok: false, error: message }, null, 2));
+    else console.error(`Error: ${message}`);
+    return 1;
+  }
+}
+
 // ---------------------------------------------------------------- main
 
 async function main() {
+  if (process.argv.length > 2) {
+    process.exitCode = await runCli(process.argv.slice(2));
+    setTimeout(() => process.exit(), 1000).unref(); // do not hang on leftover handles
+    return;
+  }
   if (!process.stdin.isTTY) {
     console.error('Run this installer in a terminal window (double-click install.cmd).');
     process.exit(1);
@@ -1205,4 +1560,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { applyConfig, buildServer, parseServer, saveEntry, findInstallations, targets, FIELDS, rollback, reviewWarnings, save, removeEntry, removeEntries };
+module.exports = { applyConfig, buildServer, parseServer, saveEntry, findInstallations, targets, FIELDS, rollback, reviewWarnings, save, removeEntry, removeEntries, loginFiles, runCli };
