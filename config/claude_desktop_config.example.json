@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "conector-salesforce": {
+    "salesforce-conector-sales": {
       "command": "npx",
       "args": [
         "-y",

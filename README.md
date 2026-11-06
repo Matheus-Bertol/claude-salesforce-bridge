@@ -18,7 +18,7 @@ Done once by a Salesforce admin.
 2. **Setup → MCP Servers**: activate `sobject-reads` (servers are inactive by default). Copy its **Server URL** exactly as shown. The URL depends on the org, so do not build it by hand.
 3. **Setup → External Client App Manager**: create or edit the External Client App.
    - Enable OAuth Settings.
-   - **Callback URL:** `http://localhost:8080/oauth/callback`. Salesforce only accepts `http://` with `localhost` and compares the value exactly. If you change the port in the client config, use the same port here.
+   - **Callback URL:** `http://localhost:8080/oauth/callback`. Salesforce only accepts `http://` with `localhost` and compares the value exactly. The port is the one in the client config (`args`, right after the Server URL; `8080` is the installer default). If you change it, use the same port here. If the client config has no port, `mcp-remote` picks one derived from the Server URL, so always set it.
    - **OAuth scopes:** `Access MCP servers (mcp_api)` and `Perform requests at any time (refresh_token, offline_access)`.
    - **Require Proof Key for Code Exchange (PKCE)**: enabled.
    - **Issue JSON Web Token (JWT)-based access tokens for named users**: enabled. This is required. Without it Salesforce issues opaque tokens (starting with `00D`) and the MCP server returns `401 Invalid token`.
@@ -40,11 +40,35 @@ Done on each user's machine. Use the installer, or follow the manual steps.
    - **Server URL** and **Consumer Key** from the Salesforce-side setup.
    - **Callback port:** `8080` by default. It must match the Callback URL in the External Client App.
    - **Where to install:** Claude Code, Claude Desktop, or both.
-5. Review the values and choose **Save**. Each config file is backed up next to itself as `<file>.bak-<date>` before it is changed.
+
+   In any field, press **Esc** or type `back` (or `cancel`) to go back one step; when a field already has a value, Enter keeps it. Pasted values are trimmed and surrounding quotes are removed.
+5. Review the values and choose **Save**. Each config file is backed up next to itself as `<file>.bak-<date>` before it is changed. Saving is all or nothing: if one file fails, the files already saved are restored from their backups. If a connector with the same name already exists in a destination, the installer asks before replacing it (default: no).
 6. Choose **Sign in and test the connection now**. The browser opens the Salesforce login; after you sign in, the installer lists the available tools. The token is saved in `%USERPROFILE%\.mcp-auth` and reused by Claude.
 7. Open Claude. `salesforce-conector-<name>` should be listed under MCP servers (Claude Code) or Settings → Developer (Claude Desktop). If it shows a warning, click **Reconnect**.
 
-**Check installations** lists every `salesforce-conector-*` connection found in the Claude Code and Claude Desktop config files. From there you can open one (details, sign-in test, open the config file in Notepad) or edit it. Connections with other names, such as those created with the manual steps below, are not listed.
+**Check installations** lists every `salesforce-conector-*` connection found in the Claude Code and Claude Desktop config files. From there you can open one (details, sign-in test, open the config file in Notepad, **Remove**) or edit it. **Remove** deletes only that connector entry (from one or more places, if it exists in several), after a confirmation and a `.bak` backup of each file; the rest of the file is kept. Connections with other names are not listed, so use `salesforce-conector-<name>` in the manual steps below too.
+
+#### Command-line mode
+
+With options, the installer runs without the menu, for scripts and agents:
+
+```
+installer\install.cmd --help
+installer\install.cmd --version
+installer\install.cmd --list [--json]
+installer\install.cmd --check <name> [--test] [--json]
+installer\install.cmd --remove <name> --from code|desktop|all --yes [--json]
+installer\install.cmd --clear-login <name> --yes [--json]
+```
+
+- `<name>` can be given with or without the `salesforce-conector-` prefix.
+- `--list` shows each connection with its place, config file, Server URL, port, `--host localhost` and whether a login is saved.
+- `--check` checks the entry, Node.js/npx, the port and the saved login. `--test` also signs in (the browser may open) and lists the tools.
+- `--remove` needs `--from` with `--yes`; `code` and `all` include every Claude Code project.
+- `--clear-login` moves only that connection's login files to a `backup-<date>` folder inside `%USERPROFILE%\.mcp-auth`. Connections with the same Server URL share the login.
+- Without `--yes`, `--remove` and `--clear-login` only show what they would do and change nothing.
+- `--json` prints machine-readable output.
+- Exit codes: `0` ok, `1` problem found or action failed, `2` usage error (including a missing `--yes`).
 
 ### Manual setup
 
@@ -59,7 +83,7 @@ Done on each user's machine. Use the installer, or follow the manual steps.
    {
      ...
      "mcpServers": {
-       "conector-salesforce": {
+       "salesforce-conector-sales": {
          "command": "npx",
          "args": [
            "-y",
@@ -77,12 +101,14 @@ Done on each user's machine. Use the installer, or follow the manual steps.
    }
    ```
 
+   Name the server `salesforce-conector-<name>` (here `sales`) so the installer can find it. `8080` is the callback port and must match the Callback URL.
+
    Use the top-level `mcpServers` key so the server is available in every folder. A server added under `projects` → `<folder>` → `mcpServers` only loads when Claude Code runs in that folder.
 
    **Claude Desktop (chat)**: `claude_desktop_config.json`, opened from **Settings → Developer → Edit Config**. It is in `%APPDATA%\Claude\`, or in `%LOCALAPPDATA%\Claude-Data\claude_<id>\` for the Microsoft Store version. Add the same `mcpServers` entry at the top level.
 
    A ready-to-copy example is in [`config/claude_desktop_config.example.json`](config/claude_desktop_config.example.json).
-5. Open Claude. `conector-salesforce` should be listed under MCP servers (Claude Code) or Settings → Developer (Claude Desktop). If it shows a warning, click **Reconnect**.
+5. Open Claude. `salesforce-conector-sales` should be listed under MCP servers (Claude Code) or Settings → Developer (Claude Desktop). If it shows a warning, click **Reconnect**.
 
 `--host localhost` is needed on Windows: by default `mcp-remote` sends `127.0.0.1` as the callback host, which does not match the Callback URL.
 
@@ -99,7 +125,7 @@ Test checklist: [TESTING.md](TESTING.md).
 - **Port 8080 in use:** usually an old `mcp-remote` process. Find it with `netstat -ano | findstr :8080` and end that `node.exe`. If you change the port, update the Callback URL too.
 - **Quotes in the `client_id` JSON break:** copy `config/oauth_client_info.example.json` to `config/oauth_client_info.json`, fill it in, and replace that argument with `"@C:\\path\\to\\config\\oauth_client_info.json"`.
 - **Claude cannot find `npx`:** use `"command": "cmd"` and start `args` with `"/c", "npx"`.
-- **Stuck sign-in or invalid token:** delete `%USERPROFILE%\.mcp-auth` and restart Claude.
+- **Stuck sign-in or invalid token:** delete `%USERPROFILE%\.mcp-auth` and restart Claude. To affect only one connection instead, run `installer\install.cmd --clear-login <name> --yes`.
 - **Logs:** add `"--debug"` to `args`. The log is written to `%USERPROFILE%\.mcp-auth\<hash>_debug.log`.
 
 ## Known limitations
@@ -108,7 +134,7 @@ Test checklist: [TESTING.md](TESTING.md).
 
 ## Roadmap
 
-- **Installer:** available as a beta in `installer/` (see [Installer (beta)](#installer-beta)). It checks Node.js, asks for the Server URL and Consumer Key, backs up and updates `%USERPROFILE%\.claude.json` and `claude_desktop_config.json`, runs the first sign-in and checks the connection. Next: a stable release.
+- **Installer:** available as a beta in `installer/` (see [Installer (beta)](#installer-beta)). It checks Node.js, asks for the Server URL and Consumer Key, backs up and updates `%USERPROFILE%\.claude.json` and `claude_desktop_config.json`, runs the first sign-in and checks the connection. It also removes connections, clears the saved login of one connection, and has a command-line mode (`--list`, `--check`, `--remove`, `--clear-login`, `--json`). Next: a stable release.
 - **Other Salesforce MCP servers:** test servers beyond `sobject-reads`, such as record updates, running Flows and calling Agentforce agents.
 - **Data dictionary:** context that maps the words users actually use to the org's data model, so Claude picks the right object and field:
   - synonyms, abbreviations and internal terms used by each team, mapped to objects and fields;
