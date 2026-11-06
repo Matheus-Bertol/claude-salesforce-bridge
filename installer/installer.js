@@ -317,15 +317,17 @@ function parseServer(server) {
   const portSet = u >= 0 && /^\d+$/.test(args[u + 1] || '');
   const port = portSet ? Number(args[u + 1]) : DEFAULT_PORT;
   let clientId = '';
+  let infoFile = '';
   const o = args.indexOf('--static-oauth-client-info');
   if (o >= 0 && args[o + 1]) {
+    if (args[o + 1].startsWith('@')) infoFile = args[o + 1].slice(1);
     try {
       let raw = args[o + 1];
       if (raw.startsWith('@')) raw = fs.readFileSync(raw.slice(1), 'utf8');
       clientId = JSON.parse(raw).client_id || '';
     } catch { /* shown as "not found" */ }
   }
-  return { url, port, portSet, clientId };
+  return { url, port, portSet, clientId, infoFile };
 }
 
 // Updates URL, port and client id in an existing entry, keeping any other
@@ -386,6 +388,38 @@ function saveEntry({ file, scope, oldName, name, cfg, written }) {
   }
   if (written) written.push(...mine);
   return mine[0].backup;
+}
+
+// Removes only the server key from its mcpServers, keeping the rest of the JSON.
+// Backup first. Successful writes are added to "written". Returns the backup.
+function removeEntry({ file, scope, name, written }) {
+  const data = readJson(file); // read right before writing
+  const servers = serversIn(data, scope);
+  if (!servers || typeof servers !== 'object' || !servers[name]) {
+    throw new Error(`${name} was not found in ${file}${scope ? ` (project ${scope})` : ''}.`);
+  }
+  delete servers[name];
+  const backup = writeJsonWithBackup(file, data);
+  if (written) written.push({ file, backup });
+  return backup;
+}
+
+// All or nothing: removes each { file, scope, name }; if one fails, the files
+// already changed are restored. Used by the menu (and later by --remove).
+function removeEntries(entries) {
+  const written = [];
+  const removed = [];
+  for (const e of entries) {
+    try {
+      removed.push({ entry: e, backup: removeEntry({ file: e.file, scope: e.scope, name: e.name, written }) });
+    } catch (err) {
+      const notUndone = rollback(written);
+      const kept = written.filter((w) => w.backup && !notUndone.includes(w)).map((w) => w.backup)
+        .concat(err.backup || []);
+      return { ok: false, removed: [], error: { entry: e, message: err.message }, notUndone, kept };
+    }
+  }
+  return { ok: true, removed, notUndone: [], kept: [] };
 }
 
 function serverExists(file, name, scope) {
@@ -643,8 +677,28 @@ async function confirmClaudeClosed(crumbs) {
 }
 
 async function save(crumbs, s) {
-  if (!(await confirmClaudeClosed(crumbs))) return false;
   const name = PREFIX + s.name;
+  // Saving over an existing connector with the same name needs an explicit yes.
+  const taken = s.mode === 'create'
+    ? s.targets.filter((t) => serverExists(t.file, name, null))
+    : (name !== s.entry.name && serverExists(s.entry.file, name, s.entry.scope) ? [s.entry] : []);
+  if (taken.length) {
+    const r = await select(crumbs, taken.length === 1
+      ? `Replace existing connector ${name} in ${taken[0].client}?`
+      : `Replace existing connector ${name} in ${taken.length} places?`, [
+      { label: 'No, back to review' },
+      { label: 'Yes, replace it' },
+    ], {
+      subtitle: 'Save',
+      body: () => {
+        taken.forEach((t) => warn(`${name} already exists in ${t.client}${t.scope ? ` (project ${t.scope})` : ''}.`));
+        taken.forEach((t) => info(paint(c.dim, t.file)));
+        out('');
+      },
+    });
+    if (r !== 1) return false;
+  }
+  if (!(await confirmClaudeClosed(crumbs))) return false;
   const cfg = { url: s.url, clientId: s.clientId, port: s.port };
   const jobs = s.mode === 'create'
     ? s.targets.map((t) => ({ client: t.client, file: t.file, scope: null, oldName: null }))
@@ -827,16 +881,91 @@ function detailsBody(e) {
   out('');
 }
 
+const placeText = (e) => `${e.client}${e.scope ? ` (project ${e.scope})` : ''}`;
+
+// Removes a connector from one or more places. Returns true if something was removed.
+async function removeFlow(crumbs, e) {
+  crumbs = [...crumbs, 'Remove'];
+  const places = findInstallations().found.filter((x) => x.name === e.name);
+  const same = (x) => x.file === e.file && x.scope === e.scope;
+  if (!places.some(same)) places.unshift(e);
+  let chosen = places;
+  if (places.length > 1) {
+    let error = '';
+    for (;;) {
+      const picked = await select(crumbs, `Remove ${e.name} from where?`, places.map((x) => ({
+        label: placeText(x), hint: x.file,
+      })), {
+        subtitle: e.name, multi: true, checked: [places.findIndex(same)],
+        body: error ? () => { fail(error); out(''); } : undefined,
+      });
+      if (picked === -1) return false;
+      if (picked.length) { chosen = picked.map((i) => places[i]); break; }
+      error = 'Mark at least one with Space.';
+    }
+  }
+
+  // The installer never creates @client-info files, so they are always kept.
+  const infoFiles = [...new Set(chosen.map((x) => x.infoFile).filter(Boolean))];
+  const r = await select(crumbs, `Remove ${e.name}?`, [
+    { label: 'Cancel' },
+    { label: 'Remove', hint: 'a backup of each file is made first' },
+  ], {
+    subtitle: 'Confirm',
+    body: () => {
+      info('This removes only this connector entry. Everything else in the files is kept:');
+      out('');
+      chosen.forEach((x) => { row('From', placeText(x)); row('', paint(c.dim, x.file)); });
+      out('');
+      infoFiles.forEach((f) => info(paint(c.dim, `Client info file kept (not created by this installer): ${f}`)));
+      if (infoFiles.length) out('');
+    },
+  });
+  if (r !== 1) return false;
+  if (!(await confirmClaudeClosed(crumbs))) return false;
+
+  const res = removeEntries(chosen);
+  envCache = undefined;
+  await select(crumbs, res.ok ? 'Removed.'
+    : (res.notUndone.length ? 'Remove failed and could not be fully undone.' : 'Remove failed. Nothing was changed.'),
+  [{ label: 'Back' }], {
+    subtitle: 'Remove',
+    body: () => {
+      if (res.ok) {
+        res.removed.forEach(({ entry, backup }) => {
+          ok(`${placeText(entry)}: removed ${entry.name}`);
+          info(paint(c.dim, entry.file));
+          if (backup) info(paint(c.dim, `Backup: ${backup}`));
+        });
+      } else {
+        fail(`${placeText(res.error.entry)}: ${res.error.message}`);
+        res.notUndone.forEach((w) => fail(w.backup
+          ? `Could not undo the change in ${w.file}. Restore it from ${w.backup}`
+          : `Could not undo the change in ${w.file}.`));
+        if (res.kept.length) {
+          out('');
+          info('Backups made before the error were kept on disk:');
+          res.kept.forEach((b) => info(paint(c.dim, b)));
+        }
+      }
+      out('');
+    },
+  });
+  return res.ok;
+}
+
 async function openMenu(e) {
   const crumbs = ['Check installations', 'Open'];
   for (;;) {
     const i = await select(crumbs, 'What do you want to do?', [
       { label: 'Sign in and test connection', disabled: !e.url || !e.clientId },
       { label: 'Open config file in Notepad' },
+      { label: 'Remove', hint: 'delete this connector from Claude' },
       { label: 'Back' },
     ], { subtitle: e.name, body: () => detailsBody(e) });
     if (i === 0) await testConnection(crumbs, e);
     else if (i === 1) spawn('notepad.exe', [e.file], { detached: true, stdio: 'ignore' }).unref();
+    else if (i === 2) { if (await removeFlow(crumbs, e)) return; }
     else return;
   }
 }
@@ -1076,4 +1205,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { applyConfig, buildServer, parseServer, saveEntry, findInstallations, targets, FIELDS, rollback, reviewWarnings, save };
+module.exports = { applyConfig, buildServer, parseServer, saveEntry, findInstallations, targets, FIELDS, rollback, reviewWarnings, save, removeEntry, removeEntries };
