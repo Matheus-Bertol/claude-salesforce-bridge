@@ -1090,6 +1090,8 @@ async function removeFlow(crumbs, e) {
           info(paint(c.dim, entry.file));
           if (backup) info(paint(c.dim, `Backup: ${backup}`));
         });
+        out('');
+        warn('Claude sessions already open keep this connector until they are restarted.');
       } else {
         fail(`${placeText(res.error.entry)}: ${res.error.message}`);
         res.notUndone.forEach((w) => fail(w.backup
@@ -1563,6 +1565,7 @@ async function cliRemove(o) {
       ok(`Removed from ${x.client}${x.scope ? ` (project ${x.scope})` : ''}: ${x.file}`);
       if (x.backup) info(paint(c.dim, `Backup: ${x.backup}`));
     });
+    if (result.removed && result.removed.length) warn('Claude sessions already open keep this connector until they are restarted.');
     if (result.error) fail(result.error);
     (result.notUndone || []).forEach((w) => fail(`Could not undo the change in ${w.file}${w.backup ? `. Restore it from ${w.backup}` : ''}`));
     (result.keptBackups || []).forEach((b) => info(paint(c.dim, `Backup kept: ${b}`)));
