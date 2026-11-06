@@ -49,3 +49,10 @@ config/claude_desktop_config.json
 
 # Local notes for Claude (not committed)
 project-context.md
+
+# Claude Code app worktrees
+.claude/worktrees/
+
+# Local Claude instructions and team agents (not published for now)
+/CLAUDE.md
+.claude/agents/
