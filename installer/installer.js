@@ -132,27 +132,52 @@ function select(crumbs, prompt, options, { subtitle, body, multi = false, checke
   });
 }
 
+// Reads one line. Returns null on Esc. Only the first line of a multi-line paste
+// is used: whatever arrives right after it is discarded so it does not fall
+// into the next prompt.
 function question(q) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    let closed = false;
+    const finish = (a) => {
+      if (closed) return;
+      closed = true;
+      process.stdin.removeListener('keypress', onKey);
+      rl.close();
+      setRaw(true);
+      process.stdin.resume();
+      setTimeout(() => {
+        setRaw(false);
+        process.stdin.pause();
+        resolve(a);
+      }, 50);
+    };
+    const onKey = (s, key = {}) => {
+      if (key.name === 'escape') finish(null);
+    };
     rl.on('SIGINT', () => { rl.close(); exitNow(); });
-    rl.question(q, (a) => { rl.close(); resolve(a); });
+    rl.question(q, (a) => finish(a));
+    process.stdin.on('keypress', onKey);
   });
 }
 
-// Text input in the "|  " style. Returns null when left empty with no current value.
+// Text input in the "|  " style. Returns null to go back: Esc, "back"/"cancel",
+// or Enter left empty with no current value.
 async function ask(label, { help, current, mask, validate, normalize } = {}) {
   for (;;) {
     out('  ' + paint(c.bold, label));
     if (help) out('  ' + paint(c.dim, help));
     if (current !== undefined) {
-      out('  ' + paint(c.dim, `Current: ${mask ? maskValue(current) : current}  (Enter keeps it)`));
+      out('  ' + paint(c.dim, `Current: ${mask ? maskValue(current) : current}  (Enter keeps it, Esc or "back" cancels)`));
     } else {
-      out('  ' + paint(c.dim, 'Leave empty and press Enter to go back.'));
+      out('  ' + paint(c.dim, 'Leave empty and press Enter (or Esc, or type "back") to go back.'));
     }
     out(paint(c.cyan, '|'));
-    let answer = (await question(paint(c.cyan, '|  '))).trim();
+    const raw = await question(paint(c.cyan, '|  '));
     out('');
+    if (raw === null) return null;
+    let answer = raw.trim();
+    if (/^(back|cancel)$/i.test(answer)) return null;
     if (answer === '') {
       if (current === undefined) return null;
       answer = current;
@@ -234,15 +259,39 @@ function stamp() {
 function writeJsonWithBackup(file, data) {
   let backup = null;
   if (fs.existsSync(file)) {
-    backup = `${file}.bak-${stamp()}`;
+    const st = stamp();
+    backup = `${file}.bak-${st}`;
+    for (let n = 2; fs.existsSync(backup); n++) backup = `${file}.bak-${st}-${n}`; // never overwrite a backup
     fs.copyFileSync(file, backup);
   } else {
     fs.mkdirSync(path.dirname(file), { recursive: true });
   }
   const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf8');
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* not created */ }
+    if (backup) e.backup = backup;
+    throw e;
+  }
   return backup;
+}
+
+// Undoes writes made by writeJsonWithBackup ({ file, backup }), newest first:
+// restores the backup, or removes the file when it did not exist before.
+// Returns the writes that could not be undone.
+function rollback(written) {
+  const failed = [];
+  for (const w of written.slice().reverse()) {
+    try {
+      if (w.backup) fs.copyFileSync(w.backup, w.file);
+      else fs.unlinkSync(w.file);
+    } catch {
+      failed.push(w);
+    }
+  }
+  return failed;
 }
 
 function serversIn(data, scope) {
@@ -265,7 +314,8 @@ function parseServer(server) {
   const args = server && Array.isArray(server.args) ? server.args.map(String) : [];
   const u = args.findIndex((a) => /^https?:\/\//i.test(a));
   const url = u >= 0 ? args[u] : '';
-  const port = u >= 0 && /^\d+$/.test(args[u + 1] || '') ? Number(args[u + 1]) : DEFAULT_PORT;
+  const portSet = u >= 0 && /^\d+$/.test(args[u + 1] || '');
+  const port = portSet ? Number(args[u + 1]) : DEFAULT_PORT;
   let clientId = '';
   const o = args.indexOf('--static-oauth-client-info');
   if (o >= 0 && args[o + 1]) {
@@ -275,12 +325,14 @@ function parseServer(server) {
       clientId = JSON.parse(raw).client_id || '';
     } catch { /* shown as "not found" */ }
   }
-  return { url, port, clientId };
+  return { url, port, portSet, clientId };
 }
 
 // Updates URL, port and client id in an existing entry, keeping any other
 // arguments the user added (--debug, "cmd /c", ...). Builds a new entry otherwise.
-function applyConfig(server, cfg) {
+// With a "writes" array, a client info file (@file) is queued there instead of
+// being written right away, so the caller can write it after the main config.
+function applyConfig(server, cfg, writes) {
   if (!server || !Array.isArray(server.args)) return buildServer(cfg);
   const s = JSON.parse(JSON.stringify(server));
   const a = s.args;
@@ -296,13 +348,16 @@ function applyConfig(server, cfg) {
     const infoFile = String(a[o + 1]).slice(1);
     const current = fs.existsSync(infoFile) ? readJson(infoFile) : {};
     current.client_id = cfg.clientId;
-    writeJsonWithBackup(infoFile, current);
+    if (writes) writes.push({ file: infoFile, data: current });
+    else writeJsonWithBackup(infoFile, current);
   } else a[o + 1] = infoArg;
   if (!a.includes('--host')) a.push('--host', 'localhost');
   return s;
 }
 
-function saveEntry({ file, scope, oldName, name, cfg }) {
+// Writes the main config first, then any client info file. If one write fails,
+// the ones already made are undone. Successful writes are added to "written".
+function saveEntry({ file, scope, oldName, name, cfg, written }) {
   const data = readJson(file); // read right before writing
   let servers;
   if (scope) {
@@ -313,10 +368,24 @@ function saveEntry({ file, scope, oldName, name, cfg }) {
     servers = data.mcpServers = data.mcpServers || {};
   }
   const base = oldName ? servers[oldName] : servers[name];
-  const server = applyConfig(base, cfg);
+  const writes = [];
+  const server = applyConfig(base, cfg, writes);
   if (oldName && oldName !== name) delete servers[oldName];
   servers[name] = server;
-  return writeJsonWithBackup(file, data);
+  const mine = [];
+  try {
+    mine.push({ file, backup: writeJsonWithBackup(file, data) });
+    for (const w of writes) mine.push({ file: w.file, backup: writeJsonWithBackup(w.file, w.data) });
+  } catch (e) {
+    const failed = rollback(mine);
+    e.message += failed.length
+      ? ` Could not undo the change in: ${failed.map((w) => w.file).join(', ')}.`
+      : (mine.length ? ' The change was undone.' : '');
+    e.backups = mine.map((w) => w.backup).concat(e.backup || []).filter(Boolean);
+    throw e;
+  }
+  if (written) written.push(...mine);
+  return mine[0].backup;
 }
 
 function serverExists(file, name, scope) {
@@ -400,6 +469,9 @@ function envBody() {
 
 // ---------------------------------------------------------------- fields
 
+// Pasted values often come with spaces or quotes around them.
+const clean = (v) => String(v).trim().replace(/^(["'])([\s\S]*)\1$/, '$2').trim();
+
 const FIELDS = {
   name: {
     label: 'Set the connection name',
@@ -410,12 +482,12 @@ const FIELDS = {
       '  Tip: use different names for each org (production, sandbox...).',
     ].join('\n'),
     normalize: (v) => {
-      const s = v.trim().toLowerCase();
+      const s = clean(v).toLowerCase();
       return s.startsWith(PREFIX) ? s.slice(PREFIX.length) : s;
     },
-    validate: (v) => (/^[a-z0-9][a-z0-9-]{0,39}$/.test(v)
+    validate: (v) => (/^[a-z0-9][a-z0-9-]{0,39}$/.test(v) && !v.endsWith('-') && !v.includes('--')
       ? null
-      : 'Use lowercase letters, numbers and hyphens (max 40), starting with a letter or number.'),
+      : 'Use lowercase letters, numbers and single hyphens (max 40), starting and ending with a letter or number.'),
   },
   url: {
     label: 'Set the Server URL',
@@ -426,9 +498,18 @@ const FIELDS = {
       '  The server must be active. If you do not have access to Setup,',
       '  ask your Salesforce administrator.',
     ].join('\n'),
-    validate: (v) => (/^https:\/\/\S+$/i.test(v)
-      ? null
-      : 'It must be the full Server URL, starting with https://'),
+    normalize: clean,
+    validate: (v) => {
+      let u = null;
+      try { u = new URL(v); } catch { /* invalid */ }
+      if (!u || !/^https:\/\/\S+$/i.test(v) || u.protocol !== 'https:' || !u.hostname) {
+        return 'It must be the full Server URL, starting with https://';
+      }
+      if (['localhost', '127.0.0.1', '[::1]'].includes(u.hostname.toLowerCase())) {
+        return 'The Server URL must point to Salesforce, not to this computer (localhost).';
+      }
+      return null;
+    },
   },
   clientId: {
     label: 'Set the Consumer Key',
@@ -440,6 +521,7 @@ const FIELDS = {
       '  If you do not have access to Setup, ask your Salesforce administrator.',
     ].join('\n'),
     mask: true,
+    normalize: clean,
     validate: (v) => (/^\S{10,}$/.test(v)
       ? null
       : 'Paste the full Consumer Key, without spaces.'),
@@ -453,6 +535,7 @@ const FIELDS = {
       '  Default is 8080. Press Enter to keep it.',
       '  If you are not sure, ask your Salesforce administrator.',
     ].join('\n'),
+    normalize: clean,
     validate: (v) => (/^\d+$/.test(v) && +v >= 1024 && +v <= 65535
       ? null
       : 'Use a number between 1024 and 65535 (for example 8080).'),
@@ -495,7 +578,12 @@ function reviewBody(s, warnings) {
   row('Name', paint(c.bold, PREFIX + s.name));
   row('Server URL', s.url);
   row('Consumer Key', maskValue(s.clientId));
-  row('Callback URL', `http://localhost:${s.port}/oauth/callback`);
+  if (s.mode !== 'create' && s.entry.portSet === false && s.port === s.entry.port) {
+    row('Callback URL', paint(c.yellow, '(not set; mcp-remote picks a port from the server URL)'));
+    row('', paint(c.dim, `Saving sets port ${s.port}: http://localhost:${s.port}/oauth/callback`));
+  } else {
+    row('Callback URL', `http://localhost:${s.port}/oauth/callback`);
+  }
   if (s.mode === 'create') {
     s.targets.forEach((t, i) => row(i ? '' : 'Install in', `${t.client}  ${paint(c.dim, t.file)}`));
   } else {
@@ -507,15 +595,31 @@ function reviewBody(s, warnings) {
   if (warnings.length) out('');
 }
 
-function reviewWarnings(s) {
+function reviewWarnings(s, portBusy) {
   const name = PREFIX + s.name;
   const w = [];
+  // Same name in other places of the file (global list or Claude Code projects).
+  const elsewhere = (client, file, skipScope) => {
+    let data;
+    try { data = readJson(file); } catch { return; }
+    if (skipScope && serversIn(data, null) && serversIn(data, null)[name]) w.push(`${name} also exists in ${client} (global).`);
+    if (!data.projects || typeof data.projects !== 'object') return;
+    for (const p of Object.keys(data.projects)) {
+      const servers = serversIn(data, p);
+      if (p !== skipScope && servers && servers[name]) w.push(`${name} also exists in ${client} (project ${p}).`);
+    }
+  };
   if (s.mode === 'create') {
-    for (const t of s.targets) if (serverExists(t.file, name, null)) w.push(`${name} already exists in ${t.client}. Saving replaces it.`);
-  } else if (name !== s.entry.name && serverExists(s.entry.file, name, s.entry.scope)) {
-    w.push(`${name} already exists in ${s.entry.client}. Saving replaces it.`);
+    for (const t of s.targets) {
+      if (serverExists(t.file, name, null)) w.push(`${name} already exists in ${t.client}. Saving replaces it.`);
+      elsewhere(t.client, t.file, null);
+    }
+  } else if (name !== s.entry.name) {
+    if (serverExists(s.entry.file, name, s.entry.scope)) w.push(`${name} already exists in ${s.entry.client}. Saving replaces it.`);
+    elsewhere(s.entry.client, s.entry.file, s.entry.scope);
   }
   if (s.port !== DEFAULT_PORT) w.push(`Port ${s.port}: update the Callback URL in Salesforce to match.`);
+  if (portBusy) w.push(`Port ${s.port} is in use right now (often by Claude or an old mcp-remote). Sign-in may fail until it is free.`);
   return w;
 }
 
@@ -546,22 +650,55 @@ async function save(crumbs, s) {
     ? s.targets.map((t) => ({ client: t.client, file: t.file, scope: null, oldName: null }))
     : [{ client: s.entry.client, file: s.entry.file, scope: s.entry.scope, oldName: s.entry.name }];
 
-  const lines = [];
-  let allOk = true;
+  // All or nothing: if one file fails, the files already saved are restored.
+  const written = [];
+  const saved = [];
+  let error = null;
   for (const j of jobs) {
     try {
-      const backup = saveEntry({ ...j, name, cfg });
+      saved.push({ j, backup: saveEntry({ ...j, name, cfg, written }) });
+    } catch (e) {
+      error = { j, e };
+      break;
+    }
+  }
+  const notUndone = error ? rollback(written) : [];
+  envCache = undefined;
+
+  const allOk = !error;
+  const lines = [];
+  if (allOk) {
+    for (const { j, backup } of saved) {
       lines.push(() => ok(`${j.client}: saved ${name}`));
       lines.push(() => info(paint(c.dim, j.file)));
       if (backup) lines.push(() => info(paint(c.dim, `Backup: ${backup}`)));
-    } catch (e) {
-      allOk = false;
-      lines.push(() => fail(`${j.client}: ${e.message}`));
+    }
+  } else {
+    lines.push(() => fail(`${error.j.client}: ${error.e.message}`));
+    lines.push(() => info(paint(c.dim, error.j.file)));
+    for (const j of jobs) {
+      if (j === error.j) continue;
+      const wasSaved = saved.some((x) => x.j === j);
+      if (!wasSaved) lines.push(() => info(`${j.client}: not changed`));
+      else if (!notUndone.some((w) => w.file === j.file)) lines.push(() => info(`${j.client}: not changed (the save was undone)`));
+      lines.push(() => info(paint(c.dim, j.file)));
+    }
+    for (const w of notUndone) {
+      lines.push(() => fail(w.backup
+        ? `Could not undo the change in ${w.file}. Restore it from ${w.backup}`
+        : `Could not remove ${w.file}, created by this save.`));
+    }
+    const kept = written.filter((w) => w.backup && !notUndone.includes(w)).map((w) => w.backup)
+      .concat(error.e.backups || []);
+    if (kept.length) {
+      lines.push(() => out(''));
+      lines.push(() => info('Backups made before the error were kept on disk:'));
+      kept.forEach((b) => lines.push(() => info(paint(c.dim, b))));
     }
   }
-  envCache = undefined;
 
-  const i = await select(crumbs, allOk ? 'Saved. Next step:' : 'Some files were not saved.', allOk
+  const i = await select(crumbs, allOk ? 'Saved. Next step:'
+    : (notUndone.length ? 'Save failed and could not be fully undone.' : 'Save failed. Nothing was changed.'), allOk
     ? [{ label: 'Sign in and test the connection now', hint: 'recommended' }, { label: 'Back to menu' }]
     : [{ label: 'Back to review' }], {
     subtitle: 'Save',
@@ -584,7 +721,12 @@ async function reviewFlow(crumbs, s) {
     if (s.mode === 'create') options.push({ label: 'Change where to install', key: 'targets' });
     options.push({ label: 'Cancel', key: 'cancel' });
 
-    const warnings = reviewWarnings(s);
+    // Non-blocking check; gives up after a short wait.
+    const portBusy = await Promise.race([
+      portFree(s.port).then((free) => !free),
+      new Promise((r) => setTimeout(r, 500, false)),
+    ]);
+    const warnings = reviewWarnings(s, portBusy);
     const i = await select(crumbs, 'Review and save', options, {
       subtitle: s.mode === 'create' ? 'Review' : `Editing ${s.entry.name}`,
       body: () => reviewBody(s, warnings),
@@ -610,15 +752,24 @@ async function createFlow() {
   const crumbs = ['Configure', 'Create'];
   const s = { mode: 'create', name: '', url: '', clientId: '', port: DEFAULT_PORT, targets: [] };
   const steps = ['name', 'url', 'clientId', 'port'];
-  for (let n = 0; n < steps.length; n++) {
+  // "Back" (Esc) returns one step; on step 1 it returns to the menu.
+  for (let n = 0; n <= steps.length;) {
+    if (n === steps.length) {
+      const t = await chooseTargets(crumbs, 'Step 5 of 5', null);
+      if (!t) { n--; continue; }
+      s.targets = t;
+      break;
+    }
     header(crumbs, `Step ${n + 1} of 5`);
-    const v = await askField(steps[n], steps[n] === 'port' ? s.port : undefined);
-    if (v === null) return;
+    const v = await askField(steps[n], s[steps[n]]);
+    if (v === null) {
+      if (n === 0) return;
+      n--;
+      continue;
+    }
     s[steps[n]] = v;
+    n++;
   }
-  const t = await chooseTargets(crumbs, 'Step 5 of 5', null);
-  if (!t) return;
-  s.targets = t;
   await reviewFlow(crumbs, s);
 }
 
@@ -670,7 +821,9 @@ function detailsBody(e) {
   row('Config file', e.file);
   row('Server URL', e.url || paint(c.yellow, '(not found in args)'));
   row('Consumer Key', e.clientId ? maskValue(e.clientId) : paint(c.yellow, '(not found)'));
-  row('Callback URL', `http://localhost:${e.port}/oauth/callback`);
+  row('Callback URL', e.portSet === false
+    ? paint(c.yellow, '(not set; mcp-remote picks a port from the server URL)')
+    : `http://localhost:${e.port}/oauth/callback`);
   out('');
 }
 
@@ -742,7 +895,10 @@ async function testConnection(crumbs, cfg) {
     fail('npx was not found next to Node.js. Reinstall Node.js LTS from https://nodejs.org.');
     return pause();
   }
-  if (!(await portFree(cfg.port))) {
+  // Entries saved without a port: mcp-remote picks it, so do not add one here.
+  const portKnown = cfg.portSet !== false;
+  const portText = portKnown ? cfg.port : '<port>';
+  if (portKnown && !(await portFree(cfg.port))) {
     const i = await select(crumbs, 'What do you want to do?', [{ label: 'Try anyway' }, { label: 'Back' }], {
       subtitle: 'Sign in and test connection',
       body: () => {
@@ -761,7 +917,7 @@ async function testConnection(crumbs, cfg) {
 
   return new Promise((resolve) => {
     const args = [
-      cli, '-y', 'mcp-remote', cfg.url, String(cfg.port),
+      cli, '-y', 'mcp-remote', cfg.url, ...(portKnown ? [String(cfg.port)] : []),
       '--static-oauth-client-info', JSON.stringify({ client_id: cfg.clientId }),
       '--host', 'localhost',
     ];
@@ -808,7 +964,7 @@ async function testConnection(crumbs, cfg) {
       } else {
         fail(message);
         if (!quiet) {
-          failureHints(log, cfg.port).forEach((h) => warn(h));
+          failureHints(log, portText).forEach((h) => warn(h));
           if (log.length) {
             out('');
             info(paint(c.dim, 'Last lines from mcp-remote:'));
@@ -867,7 +1023,7 @@ async function testConnection(crumbs, cfg) {
             info(paint(c.dim, url[0]));
           });
         } else if (/EADDRINUSE/i.test(l)) {
-          finish(false, `Port ${cfg.port} is in use.`);
+          finish(false, `Port ${portText} is in use.`);
         }
       }
     });
@@ -920,4 +1076,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { applyConfig, buildServer, parseServer, saveEntry, findInstallations, targets, FIELDS };
+module.exports = { applyConfig, buildServer, parseServer, saveEntry, findInstallations, targets, FIELDS, rollback, reviewWarnings, save };
