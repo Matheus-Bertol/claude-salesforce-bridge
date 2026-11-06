@@ -108,7 +108,7 @@ Test checklist: [TESTING.md](TESTING.md).
 
 ## Roadmap
 
-- **Installer:** an executable that configures Claude for the user. It checks Node.js, asks for the Server URL and Consumer Key, backs up and updates `%USERPROFILE%\.claude.json` and `claude_desktop_config.json`, runs the first sign-in and checks the connection.
+- **Installer:** available as a beta in `installer/` (see [Installer (beta)](#installer-beta)). It checks Node.js, asks for the Server URL and Consumer Key, backs up and updates `%USERPROFILE%\.claude.json` and `claude_desktop_config.json`, runs the first sign-in and checks the connection. Next: a stable release.
 - **Other Salesforce MCP servers:** test servers beyond `sobject-reads`, such as record updates, running Flows and calling Agentforce agents.
 - **Data dictionary:** context that maps the words users actually use to the org's data model, so Claude picks the right object and field:
   - synonyms, abbreviations and internal terms used by each team, mapped to objects and fields;
