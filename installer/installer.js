@@ -472,6 +472,56 @@ function claudeRunning() {
   return /claude\.exe/i.test(r.stdout || '');
 }
 
+function desktopProcesses() {
+  try {
+    const r = spawnSync('powershell', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath | ConvertTo-Json -Compress',
+    ], { encoding: 'utf8', timeout: 8000 });
+    const list = JSON.parse(r.stdout || '[]');
+    const rows = Array.isArray(list) ? list : [list];
+    const localApp = (process.env.LOCALAPPDATA || '').toLowerCase();
+    const pids = rows
+      .filter((p) => {
+        const ep = (p.ExecutablePath || '').toLowerCase();
+        if (!ep || !/claude\.exe$/i.test(ep)) return false;
+        return ep.includes('\\windowsapps\\claude_') ||
+          (localApp && ep.startsWith(localApp + '\\anthropicclaude\\'));
+      })
+      .map((p) => p.ProcessId);
+    if (!pids.length) return { pids: [], selfInside: false };
+    const pidSet = new Set(pids);
+    // Walk process ancestors of this Node process to detect "inside Desktop".
+    const parentOf = {};
+    rows.forEach((p) => { parentOf[p.ProcessId] = p.ParentProcessId; });
+    let cur = process.pid;
+    let selfInside = false;
+    for (let i = 0; i < 20 && cur; i++) {
+      if (pidSet.has(cur)) { selfInside = true; break; }
+      cur = parentOf[cur];
+    }
+    return { pids, selfInside };
+  } catch (_) {
+    // Safe fallback: treat as "may be open". Use empty pids so closeDesktop skips taskkill.
+    return { pids: [-1], selfInside: false };
+  }
+}
+
+function closeDesktop(pids) {
+  for (const pid of pids.filter((p) => p > 0)) {
+    spawnSync('taskkill', ['/PID', String(pid), '/T'], { stdio: 'ignore' });
+  }
+  // Wait ~4 s, sleeping 1 s between checks to avoid blocking the event loop.
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline) {
+    spawnSync('cmd', ['/c', 'timeout /t 1 /nobreak >nul'], { stdio: 'ignore' });
+    const { pids: remaining } = desktopProcesses();
+    if (!remaining.filter((p) => p > 0).length) return { closed: true };
+  }
+  const { pids: remaining } = desktopProcesses();
+  return { closed: remaining.filter((p) => p > 0).length === 0 };
+}
+
 function portFree(port) {
   return new Promise((resolve) => {
     const s = net.createServer();
@@ -683,6 +733,74 @@ async function confirmClaudeClosed(crumbs, continueLabel = 'Save anyway') {
   }
 }
 
+async function desktopGate(crumbs, hasOtherTargets) {
+  for (;;) {
+    const { pids, selfInside } = desktopProcesses();
+    if (!pids.length) return { skipped: false };
+
+    if (selfInside) {
+      const i = await select(crumbs, 'What do you want to do?', [
+        { label: 'I closed it, check again', hint: 'after closing Desktop and tray icon' },
+        ...(hasOtherTargets ? [{ label: 'Skip Desktop', hint: 'save to other targets only' }] : [{ label: 'Skip Desktop', hint: '(nothing else to save)', disabled: true }]),
+        { label: 'Back' },
+      ], {
+        subtitle: 'Claude Desktop is running',
+        body: () => {
+          warn('The installer is running inside Claude Desktop.');
+          info('To close Desktop: quit it completely (including the system tray icon) and re-run from CMD.');
+          out('');
+        },
+      });
+      if (i === 0) continue;
+      if (i === 1 && hasOtherTargets) return { skipped: true };
+      return { back: true };
+    }
+
+    const opts = [
+      { label: 'Close Claude now', hint: 'graceful close' },
+      { label: 'I closed it, check again', hint: 'after closing Desktop and tray icon' },
+      ...(hasOtherTargets ? [{ label: 'Skip Desktop', hint: 'save to other targets only' }] : [{ label: 'Skip Desktop', hint: '(nothing else to save)', disabled: true }]),
+      { label: 'Back' },
+    ];
+    const i = await select(crumbs, 'What do you want to do?', opts, {
+      subtitle: 'Claude Desktop is running',
+      body: () => {
+        warn('Claude Desktop is open. It rewrites its config and may undo this change.');
+        info('Close Desktop completely, including the icon in the system tray.');
+        out('');
+      },
+    });
+    if (i === 0) {
+      // Close Claude now (graceful).
+      const { closed } = closeDesktop(pids);
+      if (closed) return { skipped: false };
+      // Graceful close failed — offer force.
+      const fi = await select(crumbs, 'Claude Desktop is still running. Force close?', [
+        { label: 'Force close', hint: 'WARNING: open sessions may be lost' },
+        { label: 'Back' },
+      ], {
+        subtitle: 'Claude Desktop is running',
+        body: () => {
+          warn('Graceful close did not stop Claude Desktop in time.');
+          info('Force close will terminate it and all child processes.');
+          out('');
+        },
+      });
+      if (fi === 0) {
+        const { pids: p2 } = desktopProcesses();
+        for (const pid of p2.filter((p) => p > 0)) {
+          spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+        }
+        // Brief pause then continue; next loop iteration rechecks.
+      }
+      continue;
+    }
+    if (i === 1) continue; // "I closed it, check again"
+    if (i === 2 && hasOtherTargets) return { skipped: true };
+    return { back: true };
+  }
+}
+
 async function save(crumbs, s) {
   const name = PREFIX + s.name;
   // Saving over an existing connector with the same name needs an explicit yes.
@@ -705,11 +823,38 @@ async function save(crumbs, s) {
     });
     if (r !== 1) return false;
   }
-  if (!(await confirmClaudeClosed(crumbs))) return false;
   const cfg = { url: s.url, clientId: s.clientId, port: s.port };
-  const jobs = s.mode === 'create'
+  let jobs = s.mode === 'create'
     ? s.targets.map((t) => ({ client: t.client, file: t.file, scope: null, oldName: null }))
     : [{ client: s.entry.client, file: s.entry.file, scope: s.entry.scope, oldName: s.entry.name }];
+
+  const hasDesktop = jobs.some((j) => j.client === 'Claude Desktop');
+  let desktopSkipped = false;
+  if (hasDesktop) {
+    const hasOtherTargets = jobs.some((j) => j.client !== 'Claude Desktop');
+    const gate = await desktopGate(crumbs, hasOtherTargets);
+    if (gate.back) return false;
+    if (gate.skipped) {
+      jobs = jobs.filter((j) => j.client !== 'Claude Desktop');
+      desktopSkipped = true;
+    } else {
+      // One final check right before writing.
+      const { pids: remaining } = desktopProcesses();
+      if (remaining.length) {
+        // Desktop reappeared — re-enter gate.
+        const gate2 = await desktopGate(crumbs, hasOtherTargets);
+        if (gate2.back) return false;
+        if (gate2.skipped) {
+          jobs = jobs.filter((j) => j.client !== 'Claude Desktop');
+          desktopSkipped = true;
+        }
+      }
+    }
+  } else {
+    if (!(await confirmClaudeClosed(crumbs))) return false;
+  }
+
+  if (!jobs.length) return false;
 
   // All or nothing: if one file fails, the files already saved are restored.
   const written = [];
@@ -734,6 +879,7 @@ async function save(crumbs, s) {
       lines.push(() => info(paint(c.dim, j.file)));
       if (backup) lines.push(() => info(paint(c.dim, `Backup: ${backup}`)));
     }
+    if (desktopSkipped) lines.push(() => info('Claude Desktop: skipped (Claude was open)'));
   } else {
     lines.push(() => fail(`${error.j.client}: ${error.e.message}`));
     lines.push(() => info(paint(c.dim, error.j.file)));
