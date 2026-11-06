@@ -28,7 +28,25 @@ Done once by a Salesforce admin.
 
 ## Client-side setup
 
-Done on each user's machine.
+Done on each user's machine. Use the installer, or follow the manual steps.
+
+### Installer (beta)
+
+1. Install [Node.js LTS](https://nodejs.org).
+2. Close Claude completely, including the system tray icon. Claude rewrites its config files and may overwrite the changes. The installer warns you if Claude is still running.
+3. Run `installer\install.cmd` (double-click it, or run it from a terminal). Keep `install.cmd` and `installer.js` in the same folder.
+4. Choose **Configure connection → Create** and enter:
+   - **Connection name:** saved as `salesforce-conector-<name>`.
+   - **Server URL** and **Consumer Key** from the Salesforce-side setup.
+   - **Callback port:** `8080` by default. It must match the Callback URL in the External Client App.
+   - **Where to install:** Claude Code, Claude Desktop, or both.
+5. Review the values and choose **Save**. Each config file is backed up next to itself as `<file>.bak-<date>` before it is changed.
+6. Choose **Sign in and test the connection now**. The browser opens the Salesforce login; after you sign in, the installer lists the available tools. The token is saved in `%USERPROFILE%\.mcp-auth` and reused by Claude.
+7. Open Claude. `salesforce-conector-<name>` should be listed under MCP servers (Claude Code) or Settings → Developer (Claude Desktop). If it shows a warning, click **Reconnect**.
+
+**Check installations** lists every `salesforce-conector-*` connection found in the Claude Code and Claude Desktop config files. From there you can open one (details, sign-in test, open the config file in Notepad) or edit it. Connections with other names, such as those created with the manual steps below, are not listed.
+
+### Manual setup
 
 1. Install [Node.js LTS](https://nodejs.org) and check it in a terminal: `node -v` and `npx -v`.
 2. Sign in once from a terminal before configuring Claude (see [TESTING.md](TESTING.md), section 2). Claude stops a server that takes longer than about 30 seconds to start, which is not enough time to sign in through the browser. The token is saved in `%USERPROFILE%\.mcp-auth` and reused by Claude.
