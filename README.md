@@ -30,6 +30,8 @@ Done once by a Salesforce admin.
 
 Done on each user's machine. Use the installer, or follow the manual steps.
 
+For Claude Desktop, you can also let Claude do the setup for you: paste [fast-install-prompt.md](fast-install-prompt.md) into Claude Code (or any Claude that can run commands on your computer). Claude asks for each value and edits the config file.
+
 ### Installer (beta)
 
 1. Install [Node.js LTS](https://nodejs.org).
