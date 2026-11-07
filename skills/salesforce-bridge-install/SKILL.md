@@ -1,6 +1,6 @@
 ---
 name: salesforce-bridge-install
-description: Install, guide the installation of, or remove a Claude Salesforce Bridge connection (salesforce-conector-<name>, mcp-remote against a Salesforce Hosted MCP server) in Claude Code and/or Claude Desktop on Windows, with or without the installer. Use when the user wants to connect Claude to Salesforce or add, edit or remove the Salesforce connector.
+description: Install, guide the installation of, or remove a Claude Salesforce Bridge connection (salesforce-conector-<name>, mcp-remote against a Salesforce Hosted MCP server) in Claude Code and/or Claude Desktop on Windows. Use when the user wants to connect Claude to Salesforce or add, edit or remove the Salesforce connector.
 ---
 # Salesforce Bridge: install
 
@@ -8,6 +8,7 @@ description: Install, guide the installation of, or remove a Claude Salesforce B
 - Never guess values; ask the user. Never ask for a Consumer Secret (public client with PKCE). Do not echo the full Consumer Key.
 - Before writing any config: user confirms, Claude fully closed (including tray icon), backup `<file>.bak-<yyyyMMdd-HHmmss>` made. Change only the connector key.
 - On any error, use `salesforce-bridge-check`.
+- Do not run the installer (`installer\install.cmd`); do the steps below yourself. It is a menu for users who prefer not to edit the config: mention it only as an option for them to run on their own.
 
 ## Prerequisites
 - Node.js 18+ (`node -v`, `npx -v`).
@@ -20,17 +21,10 @@ description: Install, guide the installation of, or remove a Claude Salesforce B
 - **Port**: default `8080`, must match the Callback URL.
 - **Destination**: Claude Code, Claude Desktop, or both.
 
-## With the installer (preferred)
-The menu needs a real terminal, so the user runs it:
-1. Close Claude. Run `installer\install.cmd`.
-2. **Configure connection > Create**, enter the values, **Save** (backups are made automatically).
-3. **Sign in and test the connection now**, sign in in the browser.
-4. Then verify: `installer\install.cmd --check <name> --json`.
-
-## Without the installer
+## Install
 1. Files (top-level `mcpServers`):
    - Claude Code: `%USERPROFILE%\.claude.json`
-   - Claude Desktop: `%APPDATA%\Claude\claude_desktop_config.json` (Store version: `%LOCALAPPDATA%\Claude-Data\claude_<id>\`)
+   - Claude Desktop: `%APPDATA%\Claude\claude_desktop_config.json`. Store version: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json` or `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json`. Windows may redirect `%APPDATA%\Claude` to the `Packages` folder, so two paths can be the same file; edit it once.
 2. Entry to add (show it to the user first; ask before replacing an existing one):
    ```json
    "salesforce-conector-<name>": {
@@ -48,6 +42,4 @@ The menu needs a real terminal, so the user runs it:
 5. Open Claude, Reconnect the connector if needed, run `salesforce-bridge-check` and walk the user through `TESTING.md`.
 
 ## Remove
-Confirm with the user what and where.
-- Installer: `installer\install.cmd --remove <name> --json` (dry run), then `--remove <name> --from code|desktop|all --yes --json`.
-- Manual: close Claude, back up, delete only that key, validate the JSON.
+Confirm with the user what and where (Claude Code: top level and `projects[<folder>].mcpServers`; Claude Desktop). Close Claude, back up the file, delete only that key, validate the JSON.
