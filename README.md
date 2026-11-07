@@ -6,6 +6,8 @@ This guide sets up the `sobject-reads` server (read-only). The same steps work f
 
 > The configuration targets Claude. Other MCP clients that run local servers can use the same setup with their own config file.
 
+> **Tested environment:** only tested on Windows, with Claude Code and with Claude Desktop installed as a Windows package (MSIX: it runs from `C:\Program Files\WindowsApps\Claude_*` and reads its config from `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\`). Other Claude Desktop installs (for example one that uses `%APPDATA%\Claude\` directly) and other operating systems were not tested.
+
 ```
 Claude ──stdio──> mcp-remote (local) ──HTTPS/OAuth──> Salesforce Hosted MCP server
 ```
@@ -41,7 +43,8 @@ For Claude Desktop, you can also let Claude do the setup for you: paste [fast-in
    - **Connection name:** saved as `salesforce-conector-<name>`.
    - **Server URL** and **Consumer Key** from the Salesforce-side setup.
    - **Callback port:** `8080` by default. It must match the Callback URL in the External Client App.
-   - **Where to install:** Claude Code, Claude Desktop, or both.
+
+   The installer finds where Claude is installed and saves the connector in every place it finds: Claude Code (`%USERPROFILE%\.claude.json`, when it exists) and Claude Desktop (`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json` for the packaged (MSIX) version, the tested one; otherwise `%APPDATA%\Claude\claude_desktop_config.json`). The review screen lists the files before saving.
 
    In any field, press **Esc** or type `back` (or `cancel`) to go back one step; when a field already has a value, Enter keeps it. Pasted values are trimmed and surrounding quotes are removed.
 5. Review the values and choose **Save**. Each config file is backed up next to itself as `<file>.bak-<date>` before it is changed. Saving is all or nothing: if one file fails, the files already saved are restored from their backups. If a connector with the same name already exists in a destination, the installer asks before replacing it (default: no).
@@ -107,7 +110,7 @@ installer\install.cmd --clear-login <name> --yes [--json]
 
    Use the top-level `mcpServers` key so the server is available in every folder. A server added under `projects` → `<folder>` → `mcpServers` only loads when Claude Code runs in that folder.
 
-   **Claude Desktop (chat)**: `claude_desktop_config.json`, opened from **Settings → Developer → Edit Config**. It is in `%APPDATA%\Claude\`, or in `%LOCALAPPDATA%\Claude-Data\claude_<id>\` for the Microsoft Store version. Add the same `mcpServers` entry at the top level.
+   **Claude Desktop (chat)**: `claude_desktop_config.json`, opened from **Settings → Developer → Edit Config**. For the packaged (MSIX) version (the tested one) it is in `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\`; edit that file, because this version ignores `%APPDATA%\Claude\` when it has its own copy. Other installs use `%APPDATA%\Claude\` (not tested). Add the same `mcpServers` entry at the top level.
 
    A ready-to-copy example is in [`config/claude_desktop_config.example.json`](config/claude_desktop_config.example.json).
 5. Open Claude. `salesforce-conector-sales` should be listed under MCP servers (Claude Code) or Settings → Developer (Claude Desktop). If it shows a warning, click **Reconnect**.
@@ -131,6 +134,8 @@ Test checklist: [TESTING.md](TESTING.md).
 - **Logs:** add `"--debug"` to `args`. The log is written to `%USERPROFILE%\.mcp-auth\<hash>_debug.log`.
 
 ## Known limitations
+
+- **Tested environment:** Windows only, with Claude Code and the packaged (MSIX) Claude Desktop. See the note at the top.
 
 - **Token renewal:** Salesforce does not return `expires_in`, and `mcp-remote` sends `scope` on refresh, which Salesforce rejects. When the token expires, delete `%USERPROFILE%\.mcp-auth` and sign in again.
 

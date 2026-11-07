@@ -1,6 +1,6 @@
 ---
 name: salesforce-bridge-install
-description: Install, guide the installation of, or remove a Claude Salesforce Bridge connection (salesforce-conector-<name>, mcp-remote against a Salesforce Hosted MCP server) in Claude Code and/or Claude Desktop on Windows. Use when the user wants to connect Claude to Salesforce or add, edit or remove the Salesforce connector.
+description: Install, guide the installation of, or remove a Claude Salesforce Bridge connection (salesforce-conector-*, mcp-remote against a Salesforce Hosted MCP server) in Claude Code and/or Claude Desktop on Windows. Use when the user wants to connect Claude to Salesforce or add, edit or remove the Salesforce connector.
 ---
 # Salesforce Bridge: install
 
@@ -39,7 +39,7 @@ description: Install, guide the installation of, or remove a Claude Salesforce B
    If invalid, restore the backup.
 4. First sign-in (before opening Claude): the user runs in `cmd.exe` and signs in in the browser, then Ctrl+C:
    `npx -y mcp-remote <SERVER_URL> <PORT> --static-oauth-client-info "{\"client_id\":\"<KEY>\"}" --host localhost`
-5. Open Claude, Reconnect the connector if needed, run `salesforce-bridge-check` and walk the user through `TESTING.md`.
+5. Open Claude, Reconnect the connector if needed, and ask it who you are in Salesforce. If `getUserInfo` returns the user, the install is done; nothing else to configure or test. Use `salesforce-bridge-check` only if it fails.
 
 ## Remove
 Confirm with the user what and where (Claude Code: top level and `projects[<folder>].mcpServers`; Claude Desktop). Close Claude, back up the file, delete only that key, validate the JSON.

@@ -4,6 +4,8 @@ Copy everything below the line and paste it into Claude Code, or any Claude that
 
 You need: Node.js 18 or newer, Claude Desktop installed, and the **Server URL** and **Consumer Key** from your Salesforce admin. There is **no client secret**.
 
+Tested only on Windows, with Claude Desktop installed as a Windows package (MSIX, config in `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\`). Other installs were not tested.
+
 ---
 
 You are going to install a Salesforce connector in my **Claude Desktop** on Windows by running commands yourself. The connector is an `mcp-remote` entry in `claude_desktop_config.json` that points to a Salesforce Hosted MCP server and signs in with OAuth (PKCE, public client, no secret). Talk to me in my language. Explain each step in one short line before you run it.
@@ -52,24 +54,22 @@ This matches only Claude Desktop, not Claude Code. If it lists anything, ask me 
 
 ## Step 4: find the config file
 
-Claude Desktop can use either of these locations:
+Claude Desktop reads only one of these files:
 
-- Regular install: `%APPDATA%\Claude\claude_desktop_config.json`
-- Microsoft Store install: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json`
+- Packaged (MSIX) install, the tested one: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json`. When this file exists, it is the only one Claude Desktop reads; it ignores `%APPDATA%\Claude` (from a normal terminal they are two different files).
+- Other installs (not tested): `%APPDATA%\Claude\claude_desktop_config.json`.
 
 ```powershell
-$cands = @("$env:APPDATA\Claude\claude_desktop_config.json")
-$cands += Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue |
-  ForEach-Object { Join-Path $_.FullName 'LocalCache\Roaming\Claude\claude_desktop_config.json' }
-foreach ($f in $cands) {
-  if (Test-Path $f) { "$f  exists  id=$((fsutil file queryFileID $f) -replace '.*:\s*','')" }
-  else { "$f  missing (folder exists: $(Test-Path (Split-Path $f)))" }
-}
+$pkg = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue |
+  ForEach-Object { Join-Path $_.FullName 'LocalCache\Roaming\Claude\claude_desktop_config.json' } |
+  Where-Object { Test-Path $_ }
+$app = "$env:APPDATA\Claude\claude_desktop_config.json"
+if ($pkg) { $pkg } else { "$app  file exists: $(Test-Path $app)  folder exists: $(Test-Path (Split-Path $app))" }
 ```
 
-- Update **every file that exists**. If two paths show the same `id`, they are the same file, so update it only once.
-- If no file exists but one of the folders exists, create the file in that folder. Prefer the Store folder if it exists.
-- If neither the files nor the folders exist, ask me to open Claude Desktop once, close it, and run this step again.
+- If the command lists a `Packages` file, change **only** that file. Do not touch `%APPDATA%\Claude`.
+- Otherwise use `%APPDATA%\Claude\claude_desktop_config.json`. If the file does not exist but the folder does, create the file there.
+- If neither exists, ask me to open Claude Desktop once, close it, and run this step again.
 
 Show me which file(s) you will change and wait for my OK.
 

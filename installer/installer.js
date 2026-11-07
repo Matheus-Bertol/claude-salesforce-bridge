@@ -220,10 +220,8 @@ const claudeCodeConfig = () => path.join(os.homedir(), '.claude.json');
 
 function desktopConfigPaths() {
   const list = [];
+  let storeCopy = false;
   const { APPDATA, LOCALAPPDATA } = process.env;
-  if (APPDATA && fs.existsSync(path.join(APPDATA, 'Claude'))) {
-    list.push(path.join(APPDATA, 'Claude', 'claude_desktop_config.json'));
-  }
   if (LOCALAPPDATA) {
     const base = path.join(LOCALAPPDATA, 'Claude-Data'); // Microsoft Store version
     if (fs.existsSync(base)) {
@@ -235,10 +233,15 @@ function desktopConfigPaths() {
     if (fs.existsSync(pkgs)) {
       for (const d of fs.readdirSync(pkgs)) {
         if (!d.startsWith('Claude_')) continue;
-        const dir = path.join(pkgs, d, 'LocalCache', 'Roaming', 'Claude');
-        if (fs.existsSync(dir)) list.push(path.join(dir, 'claude_desktop_config.json'));
+        const file = path.join(pkgs, d, 'LocalCache', 'Roaming', 'Claude', 'claude_desktop_config.json');
+        if (fs.existsSync(file)) { list.push(file); storeCopy = true; }
       }
     }
+  }
+  // The Store app reads its private copy under Packages when it exists and ignores
+  // %APPDATA%\Claude; only use %APPDATA%\Claude when no Store copy was found.
+  if (!storeCopy && APPDATA && fs.existsSync(path.join(APPDATA, 'Claude'))) {
+    list.push(path.join(APPDATA, 'Claude', 'claude_desktop_config.json'));
   }
   // The Store path can be the same physical file as %APPDATA%\Claude: keep each file once.
   const seen = new Set();
@@ -664,26 +667,10 @@ async function askField(key, current) {
 
 // ---------------------------------------------------------------- flows
 
-async function chooseTargets(crumbs, subtitle, current) {
-  const list = targets();
-  const options = list.map((t) => ({
-    label: t.client,
-    hint: t.exists ? t.file : `${t.file}  (not found, will be created)`,
-  }));
-  if (!list.some((t) => t.client === 'Claude Desktop')) options.push({ label: 'Claude Desktop', hint: 'not found', disabled: true });
-  const checked = current
-    ? list.map((t, i) => (current.some((x) => x.file === t.file) ? i : -1)).filter((i) => i >= 0)
-    : list.map((t, i) => (t.exists ? i : -1)).filter((i) => i >= 0);
-  let error = '';
-  for (;;) {
-    const picked = await select(crumbs, 'Where should it be installed?', options, {
-      subtitle, multi: true, checked,
-      body: error ? () => { fail(error); out(''); } : undefined,
-    });
-    if (picked === -1) return null;
-    if (picked.length) return picked.map((i) => list[i]);
-    error = 'Mark at least one with Space.';
-  }
+// Every place Claude was found: Claude Code when ~/.claude.json exists, plus each
+// Claude Desktop config path found by desktopConfigPaths().
+function installTargets() {
+  return targets().filter((t) => t.client === 'Claude Desktop' || t.exists);
 }
 
 function reviewBody(s, warnings) {
@@ -697,7 +684,7 @@ function reviewBody(s, warnings) {
     row('Callback URL', `http://localhost:${s.port}/oauth/callback`);
   }
   if (s.mode === 'create') {
-    s.targets.forEach((t, i) => row(i ? '' : 'Install in', `${t.client}  ${paint(c.dim, t.file)}`));
+    s.targets.forEach((t, i) => row(i ? '' : 'Install in', `${t.client}  ${paint(c.dim, t.file + (t.exists ? '' : '  (will be created)'))}`));
   } else {
     row('Installed in', `${s.entry.client}  ${paint(c.dim, s.entry.file)}`);
     if (s.entry.scope) row('Project', s.entry.scope);
@@ -946,7 +933,6 @@ async function reviewFlow(crumbs, s) {
       { label: 'Change Consumer Key', key: 'clientId' },
       { label: 'Change callback port', key: 'port' },
     ];
-    if (s.mode === 'create') options.push({ label: 'Change where to install', key: 'targets' });
     options.push({ label: 'Cancel', key: 'cancel' });
 
     // Non-blocking check; gives up after a short wait.
@@ -965,11 +951,6 @@ async function reviewFlow(crumbs, s) {
       if (await save(crumbs, s)) return true;
       continue;
     }
-    if (key === 'targets') {
-      const t = await chooseTargets(crumbs, 'Change where to install', s.targets);
-      if (t) s.targets = t;
-      continue;
-    }
     header(crumbs, 'Change value');
     const v = await askField(key, s[key]);
     if (v !== null) s[key] = v;
@@ -978,17 +959,19 @@ async function reviewFlow(crumbs, s) {
 
 async function createFlow() {
   const crumbs = ['Configure', 'Create'];
-  const s = { mode: 'create', name: '', url: '', clientId: '', port: DEFAULT_PORT, targets: [] };
+  const found = installTargets();
+  if (!found.length) {
+    await select(crumbs, 'Nothing to install into.', [{ label: 'Back to menu' }], {
+      subtitle: 'Create',
+      body: () => { fail('Claude Code and Claude Desktop were not found on this computer.'); out(''); },
+    });
+    return;
+  }
+  const s = { mode: 'create', name: '', url: '', clientId: '', port: DEFAULT_PORT, targets: found };
   const steps = ['name', 'url', 'clientId', 'port'];
   // "Back" (Esc) returns one step; on step 1 it returns to the menu.
-  for (let n = 0; n <= steps.length;) {
-    if (n === steps.length) {
-      const t = await chooseTargets(crumbs, 'Step 5 of 5', null);
-      if (!t) { n--; continue; }
-      s.targets = t;
-      break;
-    }
-    header(crumbs, `Step ${n + 1} of 5`);
+  for (let n = 0; n < steps.length;) {
+    header(crumbs, `Step ${n + 1} of ${steps.length}`);
     const v = await askField(steps[n], s[steps[n]]);
     if (v === null) {
       if (n === 0) return;

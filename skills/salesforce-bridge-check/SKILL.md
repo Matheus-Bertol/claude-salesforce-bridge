@@ -8,21 +8,26 @@ description: Check or troubleshoot a Claude Salesforce Bridge connection (salesf
 - Read-only by default. Clearing a login, removing or restoring only after the user says yes, with Claude fully closed and a `<file>.bak-<yyyyMMdd-HHmmss>` backup first.
 - Never ask for a Consumer Secret. Never print the full Consumer Key, tokens or `.mcp-auth` content.
 - Do not run the installer (`installer\install.cmd`); do the checks below yourself. It is a menu for users who prefer not to edit the config: mention it only as an option for them to run on their own.
+- Run commands and read files yourself. Do not ask the user to paste config files. If you cannot run commands on the user's machine, ask only for the specific result you need (for example the `node -v` output), never a whole file.
+
+## Start here: getUserInfo
+If a `salesforce-conector-*` tool is available in this session, call its `getUserInfo` first. If it returns the user, the connection works: tell the user it is set up and stop. Do not run the checks below, do not ask for anything else and do not add caveats about other clients. Go on to the checks only if the tool is missing or the call fails.
 
 ## Checks
-1. Find the entry (`salesforce-conector-<name>`, or the old name `conector-salesforce`) under `mcpServers` (top level, and `projects[<folder>].mcpServers` in Claude Code) in:
+1. `node -v` (18+) and `npx -v`. Stop here if Node is missing or older.
+2. Find the entry (`salesforce-conector-<name>`, or the old name `conector-salesforce`) under `mcpServers` (top level, and `projects[<folder>].mcpServers` in Claude Code) in:
    - `%USERPROFILE%\.claude.json`
    - `%APPDATA%\Claude\claude_desktop_config.json`, `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json` or `%LOCALAPPDATA%\Claude-Data\claude_*\claude_desktop_config.json` (Windows may redirect `%APPDATA%\Claude` to the `Packages` folder, so two paths can be the same file)
-2. Expected args: `-y mcp-remote <https URL> <port> --static-oauth-client-info {"client_id":"..."} --host localhost`.
-3. `node -v` (18+), `npx -v`, port free: `netstat -ano | findstr :<port>`.
-4. Login saved if `%USERPROFILE%\.mcp-auth\mcp-remote-*\<hash>_tokens.json` exists, where `<hash>` is:
+3. Expected args: `-y mcp-remote <https URL> <port> --static-oauth-client-info {"client_id":"..."} --host localhost`.
+4. Port free: `netstat -ano | findstr :<port>`.
+5. Login saved if `%USERPROFILE%\.mcp-auth\mcp-remote-*\<hash>_tokens.json` exists, where `<hash>` is:
    `node -e "console.log(require('crypto').createHash('md5').update(process.argv[1]).digest('hex'))" "<SERVER_URL>"`
-5. Test: the user runs in `cmd.exe` and signs in in the browser:
+6. Test: the user runs in `cmd.exe` and signs in in the browser:
    `npx -y mcp-remote <SERVER_URL> <PORT> --static-oauth-client-info "{\"client_id\":\"<KEY>\"}" --host localhost`
    Then open Claude and Reconnect the connector.
 
-## End-to-end test with the user
-To confirm it works in Claude, walk the user through `TESTING.md` at the repo root, one section at a time, and wait for their result before the next. It uses the example name `conector-salesforce`; tell the user to read it as their own connector name.
+## Confirm it works
+After a fix, ask the user to restart Claude and ask it who they are in Salesforce. If `getUserInfo` returns their user, it is done; nothing else to test.
 
 ## Common errors
 - **Worked before, now 401 / invalid token**: the token expired (renewal does not work). Clear the login: move `%USERPROFILE%\.mcp-auth\mcp-remote-*\<hash>_*` to a backup folder. Sign in again.
