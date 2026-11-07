@@ -231,8 +231,29 @@ function desktopConfigPaths() {
         if (d.startsWith('claude_')) list.push(path.join(base, d, 'claude_desktop_config.json'));
       }
     }
+    const pkgs = path.join(LOCALAPPDATA, 'Packages'); // Microsoft Store (MSIX) version
+    if (fs.existsSync(pkgs)) {
+      for (const d of fs.readdirSync(pkgs)) {
+        if (!d.startsWith('Claude_')) continue;
+        const dir = path.join(pkgs, d, 'LocalCache', 'Roaming', 'Claude');
+        if (fs.existsSync(dir)) list.push(path.join(dir, 'claude_desktop_config.json'));
+      }
+    }
   }
-  return list;
+  // The Store path can be the same physical file as %APPDATA%\Claude: keep each file once.
+  const seen = new Set();
+  return list.filter((f) => {
+    let key;
+    try {
+      const s = fs.statSync(fs.existsSync(f) ? f : path.dirname(f), { bigint: true });
+      key = `${s.dev}:${s.ino}`;
+    } catch {
+      key = path.resolve(f).toLowerCase();
+    }
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function targets() {
