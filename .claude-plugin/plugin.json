@@ -1,0 +1,13 @@
+{
+  "name": "salesforce-bridge",
+  "version": "0.2.0-beta",
+  "description": "Connect Claude to a Salesforce Hosted MCP server on Windows with per-user sign-in: self-contained skills and agents to install, check, use and remove salesforce-conector-* connections.",
+  "author": {
+    "name": "Matheus Bertol",
+    "url": "https://github.com/Matheus-Bertol"
+  },
+  "homepage": "https://github.com/Matheus-Bertol/claude-salesforce-bridge",
+  "repository": "https://github.com/Matheus-Bertol/claude-salesforce-bridge",
+  "license": "MIT",
+  "keywords": ["salesforce", "mcp", "mcp-remote", "installer", "windows"]
+}
