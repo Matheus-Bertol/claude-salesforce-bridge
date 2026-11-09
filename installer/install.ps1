@@ -1,3 +1,236 @@
+<#
+  Claude Salesforce Bridge - installer (Windows)
+  Author: Matheus Bertol (https://github.com/Matheus-Bertol)
+  Source: https://github.com/Matheus-Bertol/claude-salesforce-bridge
+  License: MIT
+
+  Registers mcp-remote connections named "salesforce-conector-<name>" in Claude Code
+  (%USERPROFILE%\.claude.json) and in Claude Desktop (claude_desktop_config.json, in
+  every place it is found), runs the first sign-in and tests the connection.
+
+  Usage (PowerShell or CMD):
+      powershell -ExecutionPolicy Bypass -File install.ps1          interactive menu
+      powershell -ExecutionPolicy Bypass -File install.ps1 -Help    command-line options
+
+  Before the menu it:
+    1. checks Node.js 20+ (offers to install Node.js LTS with winget if it is missing);
+    2. installs mcp-remote once in %LOCALAPPDATA%\ClaudeSalesforceBridge\ponte (pinned
+       version), so Claude runs node.exe by its full path, without PATH or npx;
+    3. at the end, reopens Claude Desktop if it was closed while the installer ran.
+
+  The menus, config files and command-line mode run in the Node.js code embedded at
+  the end of this file (written to %LOCALAPPDATA%\ClaudeSalesforceBridge\installer).
+#>
+[CmdletBinding()]
+param(
+  [switch]$List,
+  [string]$Check,
+  [switch]$Test,
+  [string]$Remove,
+  [ValidateSet('code', 'desktop', 'all')][string]$From,
+  [string]$ClearLogin,
+  [switch]$Yes,
+  [switch]$Json,
+  [switch]$Help,
+  [switch]$Version,
+  [switch]$NoRestart,
+  [string]$Name,
+  [string]$ServerUrl,
+  [string]$ConsumerKey,
+  [string]$Port
+)
+
+# ============================== adjust here ==============================
+# Fill these to hand out a preconfigured installer: in "Configure connection >
+# Create", filled values are used without asking. Leave empty to ask.
+# The parameters -Name, -ServerUrl, -ConsumerKey and -Port override them.
+$Preset = @{
+  Name        = ''   # connection name, saved as salesforce-conector-<name>
+  ServerUrl   = ''   # Salesforce Hosted MCP Server URL (https://...)
+  ConsumerKey = ''   # Consumer Key of the External Client App (no secret)
+  Port        = ''   # callback port; empty = asked (default 8080)
+}
+$McpRemoteVersion = '0.16.5'
+$AppFolder = Join-Path $env:LOCALAPPDATA 'ClaudeSalesforceBridge'
+# =========================================================================
+
+$ErrorActionPreference = 'Stop'
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Ok($m)   { Write-Host "  [ok]  $m" -ForegroundColor Green }
+function Warn($m) { Write-Host "  [!]   $m" -ForegroundColor Yellow }
+function Fail($m) { Write-Host "  [x]   $m" -ForegroundColor Red }
+
+# Interactive runs usually have their own window: keep it open on errors.
+function Exit-Installer([int]$Code) {
+  if (-not $script:Cli -and $Code -ne 0 -and -not [Console]::IsInputRedirected) {
+    Write-Host ''
+    try { Read-Host 'Press Enter to close' | Out-Null } catch {}
+  }
+  exit $Code
+}
+
+# ---------------------------------------------------------------- Node.js
+
+function Update-PathFromRegistry {
+  $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+}
+
+function Find-Node {
+  $cmd = Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($cmd) { return $cmd.Source }
+  foreach ($p in @("$env:ProgramFiles\nodejs\node.exe", "$env:LOCALAPPDATA\Programs\nodejs\node.exe")) {
+    if (Test-Path $p) { return $p }
+  }
+  return $null
+}
+
+function Get-NodeExe {
+  $node = Find-Node
+  if (-not $node) {
+    if ($script:Cli) { Fail 'Node.js was not found. Install Node.js LTS (20 or newer) from https://nodejs.org.'; Exit-Installer 1 }
+    Warn 'Node.js was not found. It is needed to run the connector.'
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+      Fail 'winget is not available. Install Node.js LTS from https://nodejs.org and run this again.'
+      Exit-Installer 1
+    }
+    $a = Read-Host '  Install Node.js LTS now with winget? [Y/n]'
+    if ($a -match '^\s*(n|no)\s*$') { Exit-Installer 1 }
+    Write-Host '  Installing Node.js LTS (Windows may ask for permission)...' -ForegroundColor Cyan
+    winget install -e --id OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements --silent | Out-Host
+    Update-PathFromRegistry
+    $node = Find-Node
+    if (-not $node) { Fail 'Node.js is still not available. Restart the computer and run this again.'; Exit-Installer 1 }
+  }
+  $v = (& $node -v).Trim().TrimStart('v')
+  if ([int]($v.Split('.')[0]) -lt 20) {
+    Fail "Node.js $v is too old: 20 or newer is required (winget upgrade OpenJS.NodeJS.LTS)."
+    Exit-Installer 1
+  }
+  return $node
+}
+
+# ---------------------------------------------------------------- mcp-remote (local)
+
+# Installs the pinned mcp-remote in its own folder and returns the path of its
+# proxy.js, or $null (the Node.js code then falls back to npx).
+function Install-McpRemote([string]$NodeExe, [string]$Ponte) {
+  $proxy = Join-Path $Ponte 'node_modules\mcp-remote\dist\proxy.js'
+  $pkg = Join-Path $Ponte 'node_modules\mcp-remote\package.json'
+  if ((Test-Path $proxy) -and (Test-Path $pkg)) {
+    try {
+      if ((Get-Content $pkg -Raw | ConvertFrom-Json).version -eq $McpRemoteVersion) { return $proxy }
+    } catch {}
+  }
+  New-Item -ItemType Directory -Force -Path $Ponte | Out-Null
+  Write-Host "  Installing mcp-remote $McpRemoteVersion (only once)..." -ForegroundColor Cyan
+  $npmCli = Join-Path (Split-Path $NodeExe) 'node_modules\npm\bin\npm-cli.js'
+  $npmArgs = @('install', '--prefix', $Ponte, '--no-audit', '--no-fund', '--omit=dev', "mcp-remote@$McpRemoteVersion")
+  try {
+    if (Test-Path $npmCli) { & $NodeExe $npmCli @npmArgs | Out-Host } else { & npm.cmd @npmArgs | Out-Host }
+    if ($LASTEXITCODE -ne 0) { throw "npm exited with code $LASTEXITCODE" }
+  } catch {
+    Warn "Could not install mcp-remote locally ($($_.Exception.Message)). npx will be used instead."
+    return $null
+  }
+  if (-not (Test-Path $proxy)) { Warn 'mcp-remote was installed, but proxy.js was not found. npx will be used instead.'; return $null }
+  Ok "mcp-remote $McpRemoteVersion installed in $Ponte"
+  return $proxy
+}
+
+# ---------------------------------------------------------------- Claude Desktop
+
+# Same rule as the Node.js code: detect Claude Desktop by its executable path,
+# not by name (Claude Code also runs as claude.exe).
+function Get-DesktopProcesses {
+  $la = "$env:LOCALAPPDATA".ToLower()
+  @(Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    $p = "$($_.ExecutablePath)".ToLower()
+    $p -and ($p.Contains('\windowsapps\claude_') -or $p.StartsWith("$la\anthropicclaude\"))
+  })
+}
+
+function Start-ClaudeDesktop($WasRunning) {
+  $exe = ($WasRunning | Select-Object -First 1).ExecutablePath
+  try {
+    if ($exe -and $exe -notmatch '\\WindowsApps\\') { Start-Process $exe; Ok 'Claude Desktop reopened.'; return }
+    # Packaged (MSIX) app: its exe cannot be started directly.
+    $pkg = Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { $_.PackageFamilyName -like 'Claude_*' } | Select-Object -First 1
+    if ($pkg) {
+      $appId = $null
+      try { $appId = ((Get-AppxPackageManifest $pkg).Package.Applications.Application | Select-Object -First 1).Id } catch {}
+      if (-not $appId) { $appId = 'Claude' }
+      Start-Process "shell:AppsFolder\$($pkg.PackageFamilyName)!$appId"
+      Ok 'Claude Desktop reopened.'
+      return
+    }
+  } catch {}
+  Warn 'Open Claude Desktop again from the Start menu.'
+}
+
+# ---------------------------------------------------------------- main
+
+function Invoke-Installer {
+  # Command-line mode: the PowerShell switches become the options of the Node.js code.
+  $cliArgs = @()
+  if ($Help) { $cliArgs += '--help' }
+  if ($Version) { $cliArgs += '--version' }
+  if ($List) { $cliArgs += '--list' }
+  if ($script:Bound.ContainsKey('Check')) { $cliArgs += @('--check', $Check) }
+  if ($script:Bound.ContainsKey('Remove')) { $cliArgs += @('--remove', $Remove) }
+  if ($script:Bound.ContainsKey('ClearLogin')) { $cliArgs += @('--clear-login', $ClearLogin) }
+  if ($Test) { $cliArgs += '--test' }
+  if ($From) { $cliArgs += @('--from', $From.ToLower()) }
+  if ($Yes) { $cliArgs += '--yes' }
+  if ($Json) { $cliArgs += '--json' }
+  $script:Cli = $cliArgs.Count -gt 0
+
+  if (-not $script:Cli) {
+    Write-Host '------------------------------------------------------------------' -ForegroundColor Cyan
+    Write-Host '|  CLAUDE SALESFORCE BRIDGE - checking this computer' -ForegroundColor Cyan
+    Write-Host '------------------------------------------------------------------' -ForegroundColor Cyan
+  }
+  $nodeExe = Get-NodeExe
+
+  # Embedded Node.js code (menus, config files, command-line mode).
+  $jsDir = Join-Path $AppFolder 'installer'
+  New-Item -ItemType Directory -Force -Path $jsDir | Out-Null
+  $jsFile = Join-Path $jsDir 'installer.js'
+  [IO.File]::WriteAllText($jsFile, $script:InstallerJs, $Utf8NoBom)
+
+  # mcp-remote: installed in interactive mode; command-line mode only uses it if present.
+  $ponte = Join-Path $AppFolder 'ponte'
+  $proxy = Join-Path $ponte 'node_modules\mcp-remote\dist\proxy.js'
+  if (-not $script:Cli) { $proxy = Install-McpRemote $nodeExe $ponte }
+  elseif (-not (Test-Path $proxy)) { $proxy = $null }
+  $env:BRIDGE_PROXY = if ($proxy) { $proxy } else { '' }
+
+  # Values for Create: parameters win over the "adjust here" block.
+  foreach ($k in 'Name', 'ServerUrl', 'ConsumerKey', 'Port') {
+    if ($script:Bound.ContainsKey($k)) { $Preset[$k] = [string]$script:Bound[$k] }
+  }
+  $env:BRIDGE_NAME = $Preset.Name
+  $env:BRIDGE_URL = $Preset.ServerUrl
+  $env:BRIDGE_CLIENT_ID = $Preset.ConsumerKey
+  $env:BRIDGE_PORT = $Preset.Port
+  $env:BRIDGE_REOPEN = if (-not $script:Cli -and -not $NoRestart) { '1' } else { '' }
+
+  $desktopBefore = Get-DesktopProcesses
+  & $nodeExe $jsFile @cliArgs
+  $code = $LASTEXITCODE
+
+  if (-not $script:Cli -and -not $NoRestart -and $desktopBefore.Count -gt 0 -and (Get-DesktopProcesses).Count -eq 0) {
+    Start-ClaudeDesktop $desktopBefore
+  }
+  Exit-Installer $code
+}
+
+$script:Bound = $PSBoundParameters
+$script:Cli = $false
+
+# ---------------------------------------------------------------- embedded Node.js code
+# Do not edit the copy written to %LOCALAPPDATA%: it is replaced on every run.
+$script:InstallerJs = @'
 'use strict';
 
 // Claude Salesforce Bridge - interactive installer
@@ -16,7 +249,7 @@ const path = require('path');
 const readline = require('readline');
 const { spawn, spawnSync } = require('child_process');
 
-const VERSION = '0.1.0-beta';
+const VERSION = '0.2.0-beta';
 const PREFIX = 'salesforce-conector-';
 const APP = 'CLAUDE SALESFORCE BRIDGE';
 const WIDTH = 66;
@@ -218,21 +451,49 @@ function maskValue(v) {
 
 const claudeCodeConfig = () => path.join(os.homedir(), '.claude.json');
 
+// Claude Desktop reads its config from different places depending on how it was
+// installed, so the connector is saved in every candidate found (only the entry
+// is merged; the rest of each file is kept):
+//  1. packaged (MSIX) install: %LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\
+//     (the file is created if missing; this is the copy the packaged app reads)
+//  2. classic install:          %APPDATA%\Claude\
+//  3. newer Store builds:       %LOCALAPPDATA%\Claude-Data\claude_*\
 function desktopConfigPaths() {
   const list = [];
   const { APPDATA, LOCALAPPDATA } = process.env;
-  if (APPDATA && fs.existsSync(path.join(APPDATA, 'Claude'))) {
-    list.push(path.join(APPDATA, 'Claude', 'claude_desktop_config.json'));
-  }
+  const name = 'claude_desktop_config.json';
   if (LOCALAPPDATA) {
-    const base = path.join(LOCALAPPDATA, 'Claude-Data'); // Microsoft Store version
-    if (fs.existsSync(base)) {
-      for (const d of fs.readdirSync(base)) {
-        if (d.startsWith('claude_')) list.push(path.join(base, d, 'claude_desktop_config.json'));
+    const pkgs = path.join(LOCALAPPDATA, 'Packages');
+    if (fs.existsSync(pkgs)) {
+      for (const d of fs.readdirSync(pkgs)) {
+        if (/^Claude_/i.test(d)) list.push(path.join(pkgs, d, 'LocalCache', 'Roaming', 'Claude', name));
       }
     }
   }
-  return list;
+  if (APPDATA && fs.existsSync(path.join(APPDATA, 'Claude'))) list.push(path.join(APPDATA, 'Claude', name));
+  if (LOCALAPPDATA) {
+    const base = path.join(LOCALAPPDATA, 'Claude-Data');
+    if (fs.existsSync(base)) {
+      for (const d of fs.readdirSync(base)) {
+        if (/^claude_/i.test(d) && fs.statSync(path.join(base, d)).isDirectory()) list.push(path.join(base, d, name));
+      }
+    }
+  }
+  // Run from inside the packaged app, %APPDATA%\Claude is redirected to the Packages
+  // folder (same physical file): keep each file once.
+  const seen = new Set();
+  return list.filter((f) => {
+    let key;
+    try {
+      const s = fs.statSync(fs.existsSync(f) ? f : path.dirname(f), { bigint: true });
+      key = `${s.dev}:${s.ino}`;
+    } catch {
+      key = path.resolve(f).toLowerCase();
+    }
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function targets() {
@@ -244,7 +505,7 @@ function targets() {
 
 function readJson(file) {
   if (!fs.existsSync(file)) return {};
-  const text = fs.readFileSync(file, 'utf8').replace(/^﻿/, '');
+  const text = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
   if (!text.trim()) return {};
   try {
     return JSON.parse(text);
@@ -259,36 +520,31 @@ function stamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-function writeJsonWithBackup(file, data) {
-  let backup = null;
-  if (fs.existsSync(file)) {
-    const st = stamp();
-    backup = `${file}.bak-${st}`;
-    for (let n = 2; fs.existsSync(backup); n++) backup = `${file}.bak-${st}-${n}`; // never overwrite a backup
-    fs.copyFileSync(file, backup);
-  } else {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-  }
+// No backup files (user decision): the original content is kept in memory and
+// returned (null when the file did not exist), so a failed save can be undone.
+function writeJson(file, data) {
+  let original = null;
+  if (fs.existsSync(file)) original = fs.readFileSync(file, 'utf8');
+  else fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf8');
     fs.renameSync(tmp, file);
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch { /* not created */ }
-    if (backup) e.backup = backup;
     throw e;
   }
-  return backup;
+  return original;
 }
 
-// Undoes writes made by writeJsonWithBackup ({ file, backup }), newest first:
-// restores the backup, or removes the file when it did not exist before.
+// Undoes writes made by writeJson ({ file, original }), newest first: writes the
+// original content back, or removes the file when it did not exist before.
 // Returns the writes that could not be undone.
 function rollback(written) {
   const failed = [];
   for (const w of written.slice().reverse()) {
     try {
-      if (w.backup) fs.copyFileSync(w.backup, w.file);
+      if (typeof w.original === 'string') fs.writeFileSync(w.file, w.original, 'utf8');
       else fs.unlinkSync(w.file);
     } catch {
       failed.push(w);
@@ -302,15 +558,23 @@ function serversIn(data, scope) {
   return data.mcpServers;
 }
 
+// mcp-remote installed once by install.ps1 in a local folder (pinned version).
+// When it is there, Claude runs node.exe by its full path with that script, so the
+// connector depends neither on PATH nor on npx downloading the package.
+function localProxy() {
+  const p = process.env.BRIDGE_PROXY;
+  return p && fs.existsSync(p) ? p : null;
+}
+
 function buildServer(cfg) {
-  return {
-    command: 'npx',
-    args: [
-      '-y', 'mcp-remote', cfg.url, String(cfg.port),
-      '--static-oauth-client-info', JSON.stringify({ client_id: cfg.clientId }),
-      '--host', 'localhost',
-    ],
-  };
+  const rest = [
+    cfg.url, String(cfg.port),
+    '--static-oauth-client-info', JSON.stringify({ client_id: cfg.clientId }),
+    '--host', 'localhost',
+  ];
+  const proxy = localProxy();
+  if (proxy) return { command: process.execPath, args: [proxy, ...rest] };
+  return { command: 'npx', args: ['-y', 'mcp-remote', ...rest] };
 }
 
 function parseServer(server) {
@@ -358,7 +622,7 @@ function applyConfig(server, cfg, writes) {
     const current = fs.existsSync(infoFile) ? readJson(infoFile) : {};
     current.client_id = cfg.clientId;
     if (writes) writes.push({ file: infoFile, data: current });
-    else writeJsonWithBackup(infoFile, current);
+    else writeJson(infoFile, current);
   } else a[o + 1] = infoArg;
   if (!a.includes('--host')) a.push('--host', 'localhost');
   return s;
@@ -383,22 +647,21 @@ function saveEntry({ file, scope, oldName, name, cfg, written }) {
   servers[name] = server;
   const mine = [];
   try {
-    mine.push({ file, backup: writeJsonWithBackup(file, data) });
-    for (const w of writes) mine.push({ file: w.file, backup: writeJsonWithBackup(w.file, w.data) });
+    mine.push({ file, original: writeJson(file, data) });
+    for (const w of writes) mine.push({ file: w.file, original: writeJson(w.file, w.data) });
   } catch (e) {
     const failed = rollback(mine);
     e.message += failed.length
       ? ` Could not undo the change in: ${failed.map((w) => w.file).join(', ')}.`
       : (mine.length ? ' The change was undone.' : '');
-    e.backups = mine.map((w) => w.backup).concat(e.backup || []).filter(Boolean);
     throw e;
   }
   if (written) written.push(...mine);
-  return mine[0].backup;
+  return null;
 }
 
 // Removes only the server key from its mcpServers, keeping the rest of the JSON.
-// Backup first. Successful writes are added to "written". Returns the backup.
+// Successful writes are added to "written".
 function removeEntry({ file, scope, name, written }) {
   const data = readJson(file); // read right before writing
   const servers = serversIn(data, scope);
@@ -406,9 +669,9 @@ function removeEntry({ file, scope, name, written }) {
     throw new Error(`${name} was not found in ${file}${scope ? ` (project ${scope})` : ''}.`);
   }
   delete servers[name];
-  const backup = writeJsonWithBackup(file, data);
-  if (written) written.push({ file, backup });
-  return backup;
+  const original = writeJson(file, data);
+  if (written) written.push({ file, original });
+  return null;
 }
 
 // All or nothing: removes each { file, scope, name }; if one fails, the files
@@ -544,13 +807,16 @@ function envBody() {
     envCache = {
       node: process.versions.node,
       npx: !!npxCliPath(),
+      proxy: localProxy(),
       code: t.find((x) => x.client === 'Claude Code'),
       desktop: t.filter((x) => x.client === 'Claude Desktop'),
     };
   }
   const e = envCache;
   ok(`Node.js v${e.node}`);
-  if (e.npx) ok('npx'); else fail('npx not found next to Node.js');
+  if (e.proxy) ok(`mcp-remote (local) ${paint(c.dim, e.proxy)}`);
+  else if (e.npx) warn('mcp-remote local install not found: using npx');
+  else fail('mcp-remote not found (no local install and no npx next to Node.js)');
   if (e.code.exists) ok(`Claude Code   ${paint(c.dim, e.code.file)}`);
   else warn(`Claude Code config not found ${paint(c.dim, '(will be created if you install there)')}`);
   if (e.desktop.length) e.desktop.forEach((d) => ok(`Claude Desktop ${paint(c.dim, d.file)}`));
@@ -643,521 +909,10 @@ async function askField(key, current) {
 
 // ---------------------------------------------------------------- flows
 
-async function chooseTargets(crumbs, subtitle, current) {
-  const list = targets();
-  const options = list.map((t) => ({
-    label: t.client,
-    hint: t.exists ? t.file : `${t.file}  (not found, will be created)`,
-  }));
-  if (!list.some((t) => t.client === 'Claude Desktop')) options.push({ label: 'Claude Desktop', hint: 'not found', disabled: true });
-  const checked = current
-    ? list.map((t, i) => (current.some((x) => x.file === t.file) ? i : -1)).filter((i) => i >= 0)
-    : list.map((t, i) => (t.exists ? i : -1)).filter((i) => i >= 0);
-  let error = '';
-  for (;;) {
-    const picked = await select(crumbs, 'Where should it be installed?', options, {
-      subtitle, multi: true, checked,
-      body: error ? () => { fail(error); out(''); } : undefined,
-    });
-    if (picked === -1) return null;
-    if (picked.length) return picked.map((i) => list[i]);
-    error = 'Mark at least one with Space.';
-  }
-}
-
-function reviewBody(s, warnings) {
-  row('Name', paint(c.bold, PREFIX + s.name));
-  row('Server URL', s.url);
-  row('Consumer Key', maskValue(s.clientId));
-  if (s.mode !== 'create' && s.entry.portSet === false && s.port === s.entry.port) {
-    row('Callback URL', paint(c.yellow, '(not set; mcp-remote picks a port from the server URL)'));
-    row('', paint(c.dim, `Saving sets port ${s.port}: http://localhost:${s.port}/oauth/callback`));
-  } else {
-    row('Callback URL', `http://localhost:${s.port}/oauth/callback`);
-  }
-  if (s.mode === 'create') {
-    s.targets.forEach((t, i) => row(i ? '' : 'Install in', `${t.client}  ${paint(c.dim, t.file)}`));
-  } else {
-    row('Installed in', `${s.entry.client}  ${paint(c.dim, s.entry.file)}`);
-    if (s.entry.scope) row('Project', s.entry.scope);
-  }
-  out('');
-  warnings.forEach(warn);
-  if (warnings.length) out('');
-}
-
-function reviewWarnings(s, portBusy) {
-  const name = PREFIX + s.name;
-  const w = [];
-  // Same name in other places of the file (global list or Claude Code projects).
-  const elsewhere = (client, file, skipScope) => {
-    let data;
-    try { data = readJson(file); } catch { return; }
-    if (skipScope && serversIn(data, null) && serversIn(data, null)[name]) w.push(`${name} also exists in ${client} (global).`);
-    if (!data.projects || typeof data.projects !== 'object') return;
-    for (const p of Object.keys(data.projects)) {
-      const servers = serversIn(data, p);
-      if (p !== skipScope && servers && servers[name]) w.push(`${name} also exists in ${client} (project ${p}).`);
-    }
-  };
-  if (s.mode === 'create') {
-    for (const t of s.targets) {
-      if (serverExists(t.file, name, null)) w.push(`${name} already exists in ${t.client}. Saving replaces it.`);
-      elsewhere(t.client, t.file, null);
-    }
-  } else if (name !== s.entry.name) {
-    if (serverExists(s.entry.file, name, s.entry.scope)) w.push(`${name} already exists in ${s.entry.client}. Saving replaces it.`);
-    elsewhere(s.entry.client, s.entry.file, s.entry.scope);
-  }
-  if (s.port !== DEFAULT_PORT) w.push(`Port ${s.port}: update the Callback URL in Salesforce to match.`);
-  if (portBusy) w.push(`Port ${s.port} is in use right now (often by Claude or an old mcp-remote). Sign-in may fail until it is free.`);
-  return w;
-}
-
-async function confirmClaudeClosed(crumbs, continueLabel = 'Save anyway') {
-  for (;;) {
-    if (!claudeRunning()) return true;
-    const i = await select(crumbs, 'What do you want to do?', [
-      { label: 'Check again', hint: 'after closing Claude' },
-      { label: continueLabel },
-      { label: 'Cancel' },
-    ], {
-      subtitle: 'Claude is running',
-      body: () => {
-        warn('Claude seems to be open. It rewrites its config files and may undo this change.');
-        info('Close Claude completely, including the icon in the system tray.');
-        out('');
-      },
-    });
-    if (i !== 0) return i === 1;
-  }
-}
-
-async function desktopGate(crumbs, hasOtherTargets) {
-  for (;;) {
-    const { pids, selfInside } = desktopProcesses();
-    if (!pids.length) return { skipped: false };
-
-    if (selfInside) {
-      const i = await select(crumbs, 'What do you want to do?', [
-        { label: 'I closed it, check again', hint: 'after closing Desktop and tray icon' },
-        ...(hasOtherTargets ? [{ label: 'Skip Desktop', hint: 'save to other targets only' }] : [{ label: 'Skip Desktop', hint: '(nothing else to save)', disabled: true }]),
-        { label: 'Back' },
-      ], {
-        subtitle: 'Claude Desktop is running',
-        body: () => {
-          warn('The installer is running inside Claude Desktop.');
-          info('To close Desktop: quit it completely (including the system tray icon) and re-run from CMD.');
-          out('');
-        },
-      });
-      if (i === 0) continue;
-      if (i === 1 && hasOtherTargets) return { skipped: true };
-      return { back: true };
-    }
-
-    const opts = [
-      { label: 'Close Claude now', hint: 'graceful close' },
-      { label: 'I closed it, check again', hint: 'after closing Desktop and tray icon' },
-      ...(hasOtherTargets ? [{ label: 'Skip Desktop', hint: 'save to other targets only' }] : [{ label: 'Skip Desktop', hint: '(nothing else to save)', disabled: true }]),
-      { label: 'Back' },
-    ];
-    const i = await select(crumbs, 'What do you want to do?', opts, {
-      subtitle: 'Claude Desktop is running',
-      body: () => {
-        warn('Claude Desktop is open. It rewrites its config and may undo this change.');
-        info('Close Desktop completely, including the icon in the system tray.');
-        out('');
-      },
-    });
-    if (i === 0) {
-      // Close Claude now (graceful).
-      const { closed } = closeDesktop(pids);
-      if (closed) return { skipped: false };
-      // Graceful close failed — offer force.
-      const fi = await select(crumbs, 'Claude Desktop is still running. Force close?', [
-        { label: 'Force close', hint: 'WARNING: open sessions may be lost' },
-        { label: 'Back' },
-      ], {
-        subtitle: 'Claude Desktop is running',
-        body: () => {
-          warn('Graceful close did not stop Claude Desktop in time.');
-          info('Force close will terminate it and all child processes.');
-          out('');
-        },
-      });
-      if (fi === 0) {
-        const { pids: p2 } = desktopProcesses();
-        for (const pid of p2.filter((p) => p > 0)) {
-          spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
-        }
-        // Brief pause then continue; next loop iteration rechecks.
-      }
-      continue;
-    }
-    if (i === 1) continue; // "I closed it, check again"
-    if (i === 2 && hasOtherTargets) return { skipped: true };
-    return { back: true };
-  }
-}
-
-async function save(crumbs, s) {
-  const name = PREFIX + s.name;
-  // Saving over an existing connector with the same name needs an explicit yes.
-  const taken = s.mode === 'create'
-    ? s.targets.filter((t) => serverExists(t.file, name, null))
-    : (name !== s.entry.name && serverExists(s.entry.file, name, s.entry.scope) ? [s.entry] : []);
-  if (taken.length) {
-    const r = await select(crumbs, taken.length === 1
-      ? `Replace existing connector ${name} in ${taken[0].client}?`
-      : `Replace existing connector ${name} in ${taken.length} places?`, [
-      { label: 'No, back to review' },
-      { label: 'Yes, replace it' },
-    ], {
-      subtitle: 'Save',
-      body: () => {
-        taken.forEach((t) => warn(`${name} already exists in ${t.client}${t.scope ? ` (project ${t.scope})` : ''}.`));
-        taken.forEach((t) => info(paint(c.dim, t.file)));
-        out('');
-      },
-    });
-    if (r !== 1) return false;
-  }
-  const cfg = { url: s.url, clientId: s.clientId, port: s.port };
-  let jobs = s.mode === 'create'
-    ? s.targets.map((t) => ({ client: t.client, file: t.file, scope: null, oldName: null }))
-    : [{ client: s.entry.client, file: s.entry.file, scope: s.entry.scope, oldName: s.entry.name }];
-
-  const hasDesktop = jobs.some((j) => j.client === 'Claude Desktop');
-  let desktopSkipped = false;
-  if (hasDesktop) {
-    const hasOtherTargets = jobs.some((j) => j.client !== 'Claude Desktop');
-    const gate = await desktopGate(crumbs, hasOtherTargets);
-    if (gate.back) return false;
-    if (gate.skipped) {
-      jobs = jobs.filter((j) => j.client !== 'Claude Desktop');
-      desktopSkipped = true;
-    } else {
-      // One final check right before writing.
-      const { pids: remaining } = desktopProcesses();
-      if (remaining.length) {
-        // Desktop reappeared — re-enter gate.
-        const gate2 = await desktopGate(crumbs, hasOtherTargets);
-        if (gate2.back) return false;
-        if (gate2.skipped) {
-          jobs = jobs.filter((j) => j.client !== 'Claude Desktop');
-          desktopSkipped = true;
-        }
-      }
-    }
-  } else {
-    if (!(await confirmClaudeClosed(crumbs))) return false;
-  }
-
-  if (!jobs.length) return false;
-
-  // All or nothing: if one file fails, the files already saved are restored.
-  const written = [];
-  const saved = [];
-  let error = null;
-  for (const j of jobs) {
-    try {
-      saved.push({ j, backup: saveEntry({ ...j, name, cfg, written }) });
-    } catch (e) {
-      error = { j, e };
-      break;
-    }
-  }
-  const notUndone = error ? rollback(written) : [];
-  envCache = undefined;
-
-  const allOk = !error;
-  const lines = [];
-  if (allOk) {
-    for (const { j, backup } of saved) {
-      lines.push(() => ok(`${j.client}: saved ${name}`));
-      lines.push(() => info(paint(c.dim, j.file)));
-      if (backup) lines.push(() => info(paint(c.dim, `Backup: ${backup}`)));
-    }
-    if (desktopSkipped) lines.push(() => info('Claude Desktop: skipped (Claude was open)'));
-  } else {
-    lines.push(() => fail(`${error.j.client}: ${error.e.message}`));
-    lines.push(() => info(paint(c.dim, error.j.file)));
-    for (const j of jobs) {
-      if (j === error.j) continue;
-      const wasSaved = saved.some((x) => x.j === j);
-      if (!wasSaved) lines.push(() => info(`${j.client}: not changed`));
-      else if (!notUndone.some((w) => w.file === j.file)) lines.push(() => info(`${j.client}: not changed (the save was undone)`));
-      lines.push(() => info(paint(c.dim, j.file)));
-    }
-    for (const w of notUndone) {
-      lines.push(() => fail(w.backup
-        ? `Could not undo the change in ${w.file}. Restore it from ${w.backup}`
-        : `Could not remove ${w.file}, created by this save.`));
-    }
-    const kept = written.filter((w) => w.backup && !notUndone.includes(w)).map((w) => w.backup)
-      .concat(error.e.backups || []);
-    if (kept.length) {
-      lines.push(() => out(''));
-      lines.push(() => info('Backups made before the error were kept on disk:'));
-      kept.forEach((b) => lines.push(() => info(paint(c.dim, b))));
-    }
-  }
-
-  const i = await select(crumbs, allOk ? 'Saved. Next step:'
-    : (notUndone.length ? 'Save failed and could not be fully undone.' : 'Save failed. Nothing was changed.'), allOk
-    ? [{ label: 'Sign in and test the connection now', hint: 'recommended' }, { label: 'Back to menu' }]
-    : [{ label: 'Back to review' }], {
-    subtitle: 'Save',
-    body: () => { lines.forEach((l) => l()); out(''); },
-  });
-  if (!allOk) return false;
-  if (i === 0) await testConnection(crumbs, { name, ...cfg });
-  return true;
-}
-
-async function reviewFlow(crumbs, s) {
-  for (;;) {
-    const options = [
-      { label: 'Save', key: 'save' },
-      { label: 'Change connection name', key: 'name' },
-      { label: 'Change Server URL', key: 'url' },
-      { label: 'Change Consumer Key', key: 'clientId' },
-      { label: 'Change callback port', key: 'port' },
-    ];
-    if (s.mode === 'create') options.push({ label: 'Change where to install', key: 'targets' });
-    options.push({ label: 'Cancel', key: 'cancel' });
-
-    // Non-blocking check; gives up after a short wait.
-    const portBusy = await Promise.race([
-      portFree(s.port).then((free) => !free),
-      new Promise((r) => setTimeout(r, 500, false)),
-    ]);
-    const warnings = reviewWarnings(s, portBusy);
-    const i = await select(crumbs, 'Review and save', options, {
-      subtitle: s.mode === 'create' ? 'Review' : `Editing ${s.entry.name}`,
-      body: () => reviewBody(s, warnings),
-    });
-    const key = i < 0 ? 'cancel' : options[i].key;
-    if (key === 'cancel') return false;
-    if (key === 'save') {
-      if (await save(crumbs, s)) return true;
-      continue;
-    }
-    if (key === 'targets') {
-      const t = await chooseTargets(crumbs, 'Change where to install', s.targets);
-      if (t) s.targets = t;
-      continue;
-    }
-    header(crumbs, 'Change value');
-    const v = await askField(key, s[key]);
-    if (v !== null) s[key] = v;
-  }
-}
-
-async function createFlow() {
-  const crumbs = ['Configure', 'Create'];
-  const s = { mode: 'create', name: '', url: '', clientId: '', port: DEFAULT_PORT, targets: [] };
-  const steps = ['name', 'url', 'clientId', 'port'];
-  // "Back" (Esc) returns one step; on step 1 it returns to the menu.
-  for (let n = 0; n <= steps.length;) {
-    if (n === steps.length) {
-      const t = await chooseTargets(crumbs, 'Step 5 of 5', null);
-      if (!t) { n--; continue; }
-      s.targets = t;
-      break;
-    }
-    header(crumbs, `Step ${n + 1} of 5`);
-    const v = await askField(steps[n], s[steps[n]]);
-    if (v === null) {
-      if (n === 0) return;
-      n--;
-      continue;
-    }
-    s[steps[n]] = v;
-    n++;
-  }
-  await reviewFlow(crumbs, s);
-}
-
-function editState(entry) {
-  return {
-    mode: 'edit', entry,
-    name: entry.name.slice(PREFIX.length),
-    url: entry.url, clientId: entry.clientId, port: entry.port,
-  };
-}
-
-function listBody(found, errors) {
-  info(paint(c.dim, `Searching for ${PREFIX}* in:`));
-  targets().forEach((t) => info(paint(c.dim, `  ${t.client.padEnd(15)} ${t.file}${t.exists ? '' : '  (not found)'}`)));
-  out('');
-  errors.forEach(fail);
-  if (!found.length) {
-    warn('No connections found.');
-  } else {
-    ok(`${found.length} connection(s) found:`);
-    out('');
-    found.forEach((e) => {
-      out('     ' + paint(c.bold, e.name) + '  ' + paint(c.dim, e.client + (e.scope ? ` (project ${e.scope})` : '')));
-      out('     ' + paint(c.dim, e.url || '(Server URL not found)'));
-    });
-  }
-  out('');
-}
-
-async function pickInstallation(crumbs) {
-  const { found, errors } = findInstallations();
-  if (!found.length) {
-    header(crumbs);
-    errors.forEach(fail);
-    warn(`No ${PREFIX}* connections found.`);
-    await pause();
-    return null;
-  }
-  const options = found.map((e) => ({ label: e.name, hint: e.client + (e.scope ? ` - project ${e.scope}` : '') }));
-  options.push({ label: 'Back' });
-  const i = await select(crumbs, 'Which one?', options, { body: errors.length ? () => { errors.forEach(fail); out(''); } : undefined });
-  return i < 0 || i === found.length ? null : found[i];
-}
-
-function detailsBody(e) {
-  row('Name', paint(c.bold, e.name));
-  row('Client', e.client);
-  if (e.scope) row('Project', `${e.scope}  ${paint(c.dim, '(loads only in this folder)')}`);
-  row('Config file', e.file);
-  row('Server URL', e.url || paint(c.yellow, '(not found in args)'));
-  row('Consumer Key', e.clientId ? maskValue(e.clientId) : paint(c.yellow, '(not found)'));
-  row('Callback URL', e.portSet === false
-    ? paint(c.yellow, '(not set; mcp-remote picks a port from the server URL)')
-    : `http://localhost:${e.port}/oauth/callback`);
-  out('');
-}
-
-const placeText = (e) => `${e.client}${e.scope ? ` (project ${e.scope})` : ''}`;
-
-// Removes a connector from one or more places. Returns true if something was removed.
-async function removeFlow(crumbs, e) {
-  crumbs = [...crumbs, 'Remove'];
-  const places = findInstallations().found.filter((x) => x.name === e.name);
-  const same = (x) => x.file === e.file && x.scope === e.scope;
-  if (!places.some(same)) places.unshift(e);
-  let chosen = places;
-  if (places.length > 1) {
-    let error = '';
-    for (;;) {
-      const picked = await select(crumbs, `Remove ${e.name} from where?`, places.map((x) => ({
-        label: placeText(x), hint: x.file,
-      })), {
-        subtitle: e.name, multi: true, checked: [places.findIndex(same)],
-        body: error ? () => { fail(error); out(''); } : undefined,
-      });
-      if (picked === -1) return false;
-      if (picked.length) { chosen = picked.map((i) => places[i]); break; }
-      error = 'Mark at least one with Space.';
-    }
-  }
-
-  // The installer never creates @client-info files, so they are always kept.
-  const infoFiles = [...new Set(chosen.map((x) => x.infoFile).filter(Boolean))];
-  const r = await select(crumbs, `Remove ${e.name}?`, [
-    { label: 'Cancel' },
-    { label: 'Remove', hint: 'a backup of each file is made first' },
-  ], {
-    subtitle: 'Confirm',
-    body: () => {
-      info('This removes only this connector entry. Everything else in the files is kept:');
-      out('');
-      chosen.forEach((x) => { row('From', placeText(x)); row('', paint(c.dim, x.file)); });
-      out('');
-      infoFiles.forEach((f) => info(paint(c.dim, `Client info file kept (not created by this installer): ${f}`)));
-      if (infoFiles.length) out('');
-    },
-  });
-  if (r !== 1) return false;
-  if (!(await confirmClaudeClosed(crumbs, 'Continue anyway'))) return false;
-
-  const res = removeEntries(chosen);
-  envCache = undefined;
-  await select(crumbs, res.ok ? 'Removed.'
-    : (res.notUndone.length ? 'Remove failed and could not be fully undone.' : 'Remove failed. Nothing was changed.'),
-  [{ label: 'Back' }], {
-    subtitle: 'Remove',
-    body: () => {
-      if (res.ok) {
-        res.removed.forEach(({ entry, backup }) => {
-          ok(`${placeText(entry)}: removed ${entry.name}`);
-          info(paint(c.dim, entry.file));
-          if (backup) info(paint(c.dim, `Backup: ${backup}`));
-        });
-        out('');
-        warn('Claude sessions already open keep this connector until they are restarted.');
-      } else {
-        fail(`${placeText(res.error.entry)}: ${res.error.message}`);
-        res.notUndone.forEach((w) => fail(w.backup
-          ? `Could not undo the change in ${w.file}. Restore it from ${w.backup}`
-          : `Could not undo the change in ${w.file}.`));
-        if (res.kept.length) {
-          out('');
-          info('Backups made before the error were kept on disk:');
-          res.kept.forEach((b) => info(paint(c.dim, b)));
-        }
-      }
-      out('');
-    },
-  });
-  return res.ok;
-}
-
-async function openMenu(e) {
-  const crumbs = ['Check installations', 'Open'];
-  for (;;) {
-    const i = await select(crumbs, 'What do you want to do?', [
-      { label: 'Sign in and test connection', disabled: !e.url || !e.clientId },
-      { label: 'Open config file in Notepad' },
-      { label: 'Remove', hint: 'delete this connector from Claude' },
-      { label: 'Back' },
-    ], { subtitle: e.name, body: () => detailsBody(e) });
-    if (i === 0) await testConnection(crumbs, e);
-    else if (i === 1) spawn('notepad.exe', [e.file], { detached: true, stdio: 'ignore' }).unref();
-    else if (i === 2) { if (await removeFlow(crumbs, e)) return; }
-    else return;
-  }
-}
-
-async function configureMenu() {
-  const crumbs = ['Configure'];
-  for (;;) {
-    const i = await select(crumbs, 'What do you want to do?', [
-      { label: 'Create', hint: 'new connection' },
-      { label: 'Edit existing' },
-      { label: 'Back' },
-    ]);
-    if (i === 0) await createFlow();
-    else if (i === 1) {
-      const e = await pickInstallation([...crumbs, 'Edit existing']);
-      if (e) await reviewFlow([...crumbs, 'Edit existing'], editState(e));
-    } else return;
-  }
-}
-
-async function checkMenu() {
-  const crumbs = ['Check installations'];
-  for (;;) {
-    const { found, errors } = findInstallations();
-    const i = await select(crumbs, 'What do you want to do?', [
-      { label: 'Open one of them', disabled: !found.length },
-      { label: 'Edit', disabled: !found.length },
-      { label: 'Back' },
-    ], { body: () => listBody(found, errors) });
-    if (i === 0) {
-      const e = await pickInstallation([...crumbs, 'Open']);
-      if (e) await openMenu(e);
-    } else if (i === 1) {
-      const e = await pickInstallation([...crumbs, 'Edit']);
-      if (e) await reviewFlow([...crumbs, 'Edit'], editState(e));
-    } else return;
-  }
+// Every place Claude was found: Claude Code when ~/.claude.json exists, plus each
+// Claude Desktop config path found by desktopConfigPaths().
+function installTargets() {
+  return targets().filter((t) => t.client === 'Claude Desktop' || t.exists);
 }
 
 // ---------------------------------------------------------------- connection test
@@ -1176,14 +931,15 @@ function failureHints(log, port) {
 // nothing to stdout, does not wait for keys, and fills report with the result.
 async function testConnection(crumbs, cfg, report) {
   const batch = !!report;
-  const cli = npxCliPath();
+  const proxy = localProxy();
+  const cli = proxy || npxCliPath();
   if (!cli && batch) {
-    Object.assign(report, { success: false, message: 'npx was not found next to Node.js.' });
+    Object.assign(report, { success: false, message: 'mcp-remote was not found (no local install and no npx next to Node.js).' });
     return false;
   }
   if (!cli) {
     header(crumbs, 'Sign in and test connection');
-    fail('npx was not found next to Node.js. Reinstall Node.js LTS from https://nodejs.org.');
+    fail('mcp-remote was not found (no local install and no npx next to Node.js). Run install.ps1 again.');
     return pause();
   }
   // Entries saved without a port: mcp-remote picks it, so do not add one here.
@@ -1210,7 +966,7 @@ async function testConnection(crumbs, cfg, report) {
 
   return new Promise((resolve) => {
     const args = [
-      cli, '-y', 'mcp-remote', cfg.url, ...(portKnown ? [String(cfg.port)] : []),
+      ...(proxy ? [proxy] : [cli, '-y', 'mcp-remote']), cfg.url, ...(portKnown ? [String(cfg.port)] : []),
       '--static-oauth-client-info', JSON.stringify({ client_id: cfg.clientId }),
       '--host', 'localhost',
     ];
@@ -1348,19 +1104,25 @@ async function testConnection(crumbs, cfg, report) {
 const USAGE = [
   `Claude Salesforce Bridge installer v${VERSION}`,
   '',
-  'Without options it opens the interactive menu. Options:',
-  '  --list [--json]                       List salesforce-conector-* connections',
-  '  --check <name> [--test] [--json]      Check a connection. --test also signs in',
-  '                                        (may open the browser) and lists the tools',
-  '  --remove <name> --from code|desktop|all --yes [--json]',
-  '                                        Remove a connection (backup .bak first).',
-  '                                        --from is required with --yes; code and',
-  '                                        all include every Claude Code project',
-  '  --clear-login <name> --yes [--json]   Move the saved login of a connection to',
-  '                                        a backup folder inside .mcp-auth',
-  '  --version, --help',
+  'Usage: powershell -ExecutionPolicy Bypass -File install.ps1 [options]',
   '',
-  'Without --yes, --remove and --clear-login only show what they would do',
+  'Without options it opens the interactive menu. Options:',
+  '  -List [-Json]                         List salesforce-conector-* connections',
+  '  -Check <name> [-Test] [-Json]         Check a connection. -Test also signs in',
+  '                                        (may open the browser) and lists the tools',
+  '  -Remove <name> -From code|desktop|all -Yes [-Json]',
+  '                                        Remove a connection.',
+  '                                        -From is required with -Yes; code and',
+  '                                        all include every Claude Code project',
+  '  -ClearLogin <name> -Yes [-Json]       Move the saved login of a connection to',
+  '                                        a backup folder inside .mcp-auth',
+  '  -Version, -Help',
+  '',
+  'Interactive mode also accepts -Name, -ServerUrl, -ConsumerKey and -Port',
+  '(or the "adjust here" block at the top of install.ps1): filled values are',
+  'not asked again in Create. -NoRestart: do not reopen Claude Desktop.',
+  '',
+  'Without -Yes, -Remove and -ClearLogin only show what they would do',
   'and exit with code 2 (nothing is changed).',
   'Exit codes: 0 ok, 1 problem found or action failed, 2 usage error.',
 ].join('\n');
@@ -1418,11 +1180,11 @@ function parseCli(argv) {
     else throw new Error(`Unknown option: ${a}`);
   }
   if (!o.cmd) throw new Error('Missing command.');
-  if (o.test && o.cmd !== 'check') throw new Error('--test works only with --check.');
-  if (o.from !== null && o.cmd !== 'remove') throw new Error('--from works only with --remove.');
-  if (o.from !== null && !['code', 'desktop', 'all'].includes(o.from)) throw new Error('--from must be code, desktop or all.');
+  if (o.test && o.cmd !== 'check') throw new Error('-Test works only with -Check.');
+  if (o.from !== null && o.cmd !== 'remove') throw new Error('-From works only with -Remove.');
+  if (o.from !== null && !['code', 'desktop', 'all'].includes(o.from)) throw new Error('-From must be code, desktop or all.');
   if (o.cmd === 'remove' && o.yes && o.from === null) {
-    throw new Error('--remove with --yes needs --from code, desktop or all (code and all include every Claude Code project).');
+    throw new Error('-Remove with -Yes needs -From code, desktop or all (code and all include every Claude Code project).');
   }
   if (o.name !== null) {
     const n = FIELDS.name.normalize(o.name);
@@ -1459,8 +1221,9 @@ async function cliCheck(o) {
   const add = (list, level, id, message) => list.push({ id, level, message });
   const checks = [];
   const major = Number(process.versions.node.split('.')[0]);
-  add(checks, major >= 18 ? 'ok' : 'error', 'node', `Node.js v${process.versions.node}${major >= 18 ? '' : ' (18 or newer is required)'}`);
-  add(checks, npxCliPath() ? 'ok' : 'error', 'npx', npxCliPath() ? 'npx found' : 'npx not found next to Node.js');
+  add(checks, major >= 20 ? 'ok' : 'error', 'node', `Node.js v${process.versions.node}${major >= 20 ? '' : ' (20 or newer is required)'}`);
+  if (localProxy()) add(checks, 'ok', 'mcp-remote', `mcp-remote (local) ${localProxy()}`);
+  else add(checks, npxCliPath() ? 'warn' : 'error', 'mcp-remote', npxCliPath() ? 'mcp-remote local install not found: using npx' : 'mcp-remote not found (no local install and no npx next to Node.js)');
   errors.forEach((m) => add(checks, 'warn', 'config', m));
   if (!places.length) add(checks, 'error', 'entry', `${o.name} was not found.`);
 
@@ -1483,7 +1246,7 @@ async function cliCheck(o) {
     }
     const login = loginFiles(p);
     add(pc, login.supported && login.saved ? 'ok' : 'warn', 'login',
-      !login.supported ? login.reason : login.saved ? 'Login saved' : 'No saved login (sign in with --test or from Claude)');
+      !login.supported ? login.reason : login.saved ? 'Login saved' : 'No saved login (sign in with -Test or from Claude)');
     result.places.push({ client: p.client, scope: p.scope, file: p.file, checks: pc });
   }
 
@@ -1543,7 +1306,7 @@ async function cliRemove(o) {
     result = { ok: false, error: `${o.name} was not found${from === 'all' ? '' : ` in ${from}`}.` };
     code = 1;
   } else if (!o.yes) {
-    result = { ok: false, dryRun: true, wouldRemove: where, error: 'Nothing was removed. Add --yes to remove.' };
+    result = { ok: false, dryRun: true, wouldRemove: where, error: 'Nothing was removed. Add -Yes to remove.' };
     code = 2;
   } else {
     const res = removeEntries(places);
@@ -1599,7 +1362,7 @@ async function cliClearLogin(o) {
     if (!files.length) {
       result = { ok: true, moved: [], message: 'No saved login found.' };
     } else if (!o.yes) {
-      result = { ok: false, dryRun: true, wouldMove: files, error: 'Nothing was moved. Add --yes to clear the login.' };
+      result = { ok: false, dryRun: true, wouldMove: files, error: 'Nothing was moved. Add -Yes to clear the login.' };
       code = 2;
     } else {
       // Moved (not deleted) to <base>\backup-<date>\<mcp-remote folder>\, which mcp-remote does not read.
@@ -1667,6 +1430,232 @@ async function runCli(argv) {
   }
 }
 
+// ---------------------------------------------------------------- live status
+
+// Checks a connection against Salesforce with its saved token (no browser, no
+// mcp-remote): sends an MCP "initialize" and looks at the HTTP status.
+// state: 'connected' | 'expired' | 'no-login' | 'error'.
+async function connectionStatus(e) {
+  if (!e.url) return { state: 'error', detail: 'Server URL not found in the entry' };
+  const login = loginFiles(e);
+  if (!login.supported) return { state: 'error', detail: login.reason };
+  const tokenFile = login.files
+    .filter((f) => f.endsWith('_tokens.json'))
+    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+  if (!tokenFile) return { state: 'no-login', detail: 'No saved login' };
+  let token = '';
+  try { token = JSON.parse(fs.readFileSync(tokenFile, 'utf8')).access_token || ''; } catch { /* unreadable */ }
+  if (!token) return { state: 'no-login', detail: 'The saved login is empty' };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(e.url, {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'claude-salesforce-bridge-installer', version: VERSION } },
+      }),
+    });
+    try { if (r.body) await r.body.cancel(); } catch { /* ignore */ }
+    if (r.ok) return { state: 'connected', detail: 'Connected' };
+    if (r.status === 401 || r.status === 403) return { state: 'expired', detail: 'Login expired' };
+    return { state: 'error', detail: `Salesforce answered HTTP ${r.status}` };
+  } catch (err) {
+    const why = err && err.name === 'AbortError' ? 'no answer (timeout)' : ((err && err.cause && err.cause.code) || (err && err.message) || String(err));
+    return { state: 'error', detail: `Could not reach Salesforce: ${why}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Prints every salesforce-conector-* connection with its live status.
+// Returns one row per connection: { e, places, st }.
+async function showStatus(title) {
+  out('  ' + paint(c.bold, title));
+  const { found, errors } = findInstallations();
+  errors.forEach((m) => warn(m));
+  if (!found.length) {
+    info(paint(c.dim, `No ${PREFIX}* connection yet.`));
+    out('');
+    return [];
+  }
+  const groups = new Map(); // same name and Server URL = same login
+  for (const e of found) {
+    const k = `${e.name}|${e.url}`;
+    if (!groups.has(k)) groups.set(k, { e, places: new Set() });
+    groups.get(k).places.add(e.client + (e.scope ? ` (project ${e.scope})` : ''));
+  }
+  out(paint(c.dim, '  Checking with Salesforce...'));
+  const rows = await Promise.all([...groups.values()].map(async (g) => ({ e: g.e, places: [...g.places], st: await connectionStatus(g.e) })));
+  process.stdout.write('\x1b[1A\x1b[2K');
+  for (const r of rows) {
+    const label = `${r.e.name}  ${paint(c.dim, r.places.join(', '))}`;
+    if (r.st.state === 'connected') ok(`${label}  ${paint(c.green, 'CONNECTED')}`);
+    else if (r.st.state === 'expired') fail(`${label}  ${paint(c.red, 'LOGIN EXPIRED')}`);
+    else if (r.st.state === 'no-login') warn(`${label}  ${paint(c.yellow, 'NOT SIGNED IN')}`);
+    else fail(`${label}  ${paint(c.red, 'ERROR')}  ${paint(c.dim, r.st.detail)}`);
+  }
+  out('');
+  return rows;
+}
+
+// ---------------------------------------------------------------- linear install
+
+// Yes/no question. Enter = default, Esc = no.
+async function yesNo(q, def = true) {
+  for (;;) {
+    const a = await question(`  ${paint(c.bold, q)} ${paint(c.dim, def ? '[Y/n]' : '[y/N]')} `);
+    if (a === null) return false;
+    const v = a.trim().toLowerCase();
+    if (!v) return def;
+    if (/^(y|yes|s|sim)$/.test(v)) return true;
+    if (/^(n|no|nao)$/.test(v)) return false;
+  }
+}
+
+// Claude Desktop rewrites its config when it closes, so it must be closed while
+// saving. Returns 'ok', 'skip' (save without Desktop) or 'cancel'.
+async function desktopCheck(hasOtherTargets) {
+  for (;;) {
+    const { pids, selfInside } = desktopProcesses();
+    if (!pids.length) return 'ok';
+    warn('Claude Desktop is open. It rewrites its config when it closes and may undo this change.');
+    if (selfInside) {
+      info('This installer runs inside Claude Desktop, so it cannot close it. Close Desktop');
+      info('(including the tray icon), or run install.cmd from a normal window.');
+      if (await yesNo('I closed Claude Desktop. Check again?')) continue;
+    } else {
+      const reopen = process.env.BRIDGE_REOPEN === '1' ? ' It is reopened at the end.' : '';
+      if (await yesNo(`Close Claude Desktop now?${reopen}`)) {
+        if (closeDesktop(pids).closed) { ok('Claude Desktop closed.'); return 'ok'; }
+        warn('Claude Desktop did not close in time.');
+        if (await yesNo('Force close it? Open Desktop sessions may be lost.', false)) {
+          for (const pid of desktopProcesses().pids.filter((p) => p > 0)) {
+            spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+          }
+          continue;
+        }
+      }
+    }
+    if (hasOtherTargets && await yesNo('Save only in Claude Code (skip Claude Desktop)?')) return 'skip';
+    return 'cancel';
+  }
+}
+
+// The saved token cannot be renewed (mcp-remote sends "scope" on refresh and
+// Salesforce rejects it), so signing in again means: clear that login, sign in.
+async function signInAgain(e) {
+  out('');
+  await cliClearLogin({ name: e.name, yes: true, json: false });
+  await testConnection([], { name: e.name, url: e.url, clientId: e.clientId, port: e.port, portSet: e.portSet });
+}
+
+async function linearInstall() {
+  header([], `Installer v${VERSION}`);
+  envBody();
+  const before = await showStatus('Connections');
+
+  for (const r of before.filter((x) => x.st.state === 'expired' || x.st.state === 'no-login')) {
+    if (await yesNo(`Sign in to ${r.e.name} again now? The browser opens.`)) {
+      await signInAgain(r.e);
+      header([], `Installer v${VERSION}`);
+      await showStatus('Connections');
+    }
+  }
+
+  const targetsFound = installTargets();
+  if (!targetsFound.length) {
+    fail('Claude Code and Claude Desktop were not found on this computer.');
+    return 1;
+  }
+  out('');
+  if (!(await yesNo('Install a Salesforce connection now?', !before.length))) return 0;
+  out('');
+
+  // Values filled in the "adjust here" block of install.ps1 (or its parameters):
+  // a valid value is used without asking; an invalid one is asked, shown as the current value.
+  const s = { name: '', url: '', clientId: '', port: DEFAULT_PORT };
+  const preset = { name: process.env.BRIDGE_NAME, url: process.env.BRIDGE_URL, clientId: process.env.BRIDGE_CLIENT_ID, port: process.env.BRIDGE_PORT };
+  const steps = [];
+  for (const key of ['name', 'url', 'clientId', 'port']) {
+    const raw = preset[key];
+    if (raw === undefined || String(raw).trim() === '') { steps.push(key); continue; }
+    const v = FIELDS[key].normalize(raw);
+    s[key] = key === 'port' && /^\d+$/.test(v) ? Number(v) : v;
+    if (FIELDS[key].validate(v)) steps.push(key);
+  }
+  // Esc or "back" returns one step; on the first step it cancels.
+  for (let n = 0; n < steps.length;) {
+    out(paint(c.dim, `  Step ${n + 1} of ${steps.length}`));
+    const v = await askField(steps[n], s[steps[n]]);
+    if (v === null) {
+      if (n === 0) { warn('Nothing was saved.'); return 0; }
+      n--;
+      continue;
+    }
+    s[steps[n]] = v;
+    n++;
+  }
+
+  const name = PREFIX + s.name;
+  out('  ' + paint(c.bold, 'Summary'));
+  row('Name', paint(c.bold, name));
+  row('Server URL', s.url);
+  row('Consumer Key', maskValue(s.clientId));
+  row('Callback URL', `http://localhost:${s.port}/oauth/callback`);
+  targetsFound.forEach((t, i) => row(i ? '' : 'Install in', `${t.client}  ${paint(c.dim, t.file + (t.exists ? '' : '  (will be created)'))}`));
+  out('');
+  if (s.port !== DEFAULT_PORT) warn(`Port ${s.port}: the Callback URL in Salesforce must use this port.`);
+  if (!(await portFree(s.port))) warn(`Port ${s.port} is in use right now (often by Claude or an old mcp-remote). Sign-in may fail until it is free.`);
+  const taken = targetsFound.filter((t) => serverExists(t.file, name, null));
+  taken.forEach((t) => warn(`${name} already exists in ${t.client}. Saving replaces it.`));
+  if (!(await yesNo(taken.length ? 'Replace and save?' : 'Save?', !taken.length))) { warn('Nothing was saved.'); return 0; }
+
+  let jobs = targetsFound;
+  if (jobs.some((j) => j.client === 'Claude Desktop')) {
+    const g = await desktopCheck(jobs.some((j) => j.client !== 'Claude Desktop'));
+    if (g === 'cancel') { warn('Nothing was saved.'); return 1; }
+    if (g === 'skip') jobs = jobs.filter((j) => j.client !== 'Claude Desktop');
+  } else if (claudeRunning()) {
+    warn('Claude seems to be open. It rewrites its config files and may undo this change.');
+    if (!(await yesNo('Save anyway?', false))) { warn('Nothing was saved.'); return 1; }
+  }
+
+  // All or nothing: if one file fails, the files already saved are restored.
+  const cfg = { url: s.url, clientId: s.clientId, port: s.port };
+  const written = [];
+  for (const j of jobs) {
+    try {
+      saveEntry({ file: j.file, scope: null, oldName: null, name, cfg, written });
+    } catch (e) {
+      const notUndone = rollback(written);
+      fail(`Could not save in ${j.file}: ${e.message}`);
+      notUndone.forEach((w) => fail(`Could not undo the change in ${w.file}`));
+      if (written.length && !notUndone.length) info('The files already saved were restored. Nothing was changed.');
+      return 1;
+    }
+  }
+  envCache = undefined;
+  out('');
+  jobs.forEach((j) => ok(`Saved in ${j.client}  ${paint(c.dim, j.file)}`));
+  out('');
+
+  if (await yesNo('Sign in and test the connection now? The browser may open.')) {
+    await testConnection([], { name, ...cfg });
+    header([], 'Done');
+  }
+  await showStatus('Connections');
+  info(`Open Claude: ${name} is listed under MCP servers (Claude Code)`);
+  info('or Settings > Developer (Claude Desktop).');
+  return 0;
+}
+
 // ---------------------------------------------------------------- main
 
 async function main() {
@@ -1676,28 +1665,17 @@ async function main() {
     return;
   }
   if (!process.stdin.isTTY) {
-    console.error('Run this installer in a terminal window (double-click install.cmd).');
+    console.error('Run this installer in a terminal window: powershell -ExecutionPolicy Bypass -File install.ps1');
     process.exit(1);
   }
   const major = Number(process.versions.node.split('.')[0]);
-  if (major < 18) {
-    console.error(`Node.js 18 or newer is required (found v${process.versions.node}). Install Node.js LTS from https://nodejs.org.`);
+  if (major < 20) {
+    console.error(`Node.js 20 or newer is required (found v${process.versions.node}). Install Node.js LTS from https://nodejs.org.`);
     process.exit(1);
   }
-  for (;;) {
-    const i = await select([], 'Main menu', [
-      { label: 'Configure connection', hint: 'create or edit' },
-      { label: 'Check installations', hint: `find ${PREFIX}*` },
-      { label: 'Exit' },
-    ], { subtitle: `Installer v${VERSION}`, body: envBody });
-    if (i === 0) await configureMenu();
-    else if (i === 1) await checkMenu();
-    else {
-      clear();
-      out('Bye.');
-      process.exit(0);
-    }
-  }
+  const code = await linearInstall();
+  await pause('Press any key to close...');
+  process.exit(code);
 }
 
 if (require.main === module) {
@@ -1709,4 +1687,7 @@ if (require.main === module) {
   });
 }
 
-module.exports = { applyConfig, buildServer, parseServer, saveEntry, findInstallations, targets, FIELDS, rollback, reviewWarnings, save, removeEntry, removeEntries, loginFiles, runCli };
+module.exports = { applyConfig, buildServer, parseServer, saveEntry, findInstallations, targets, FIELDS, rollback, removeEntry, removeEntries, loginFiles, runCli, connectionStatus };
+'@
+
+Invoke-Installer
