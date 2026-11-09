@@ -8,15 +8,17 @@ description: Check or troubleshoot a Claude Salesforce Bridge connection (salesf
 - Read-only by default. Clearing a login, removing or restoring only after the user says yes.
 - Never ask for a Consumer Secret. Never print the full Consumer Key, tokens or `.mcp-auth` content.
 - Run commands and read files yourself. Do not ask the user to paste config files. If you cannot run commands on the user's machine, ask only for the specific result you need (for example the `node -v` output), never a whole file.
-- Recommend the installer's check options first; the manual checks are more complex and easier to get wrong. Ask before downloading anything.
+- Recommend the installer's check options first; the manual checks are more complex and easier to get wrong.
+- The installer is bundled with this skill: `scripts/install.ps1`, in the same folder as this `SKILL.md`. Use that file; do not download it from anywhere else and do not edit it.
 
 ## Start here: getUserInfo
 If a `salesforce-conector-*` tool is available in this session, call its `getUserInfo` first. If it returns the user, the connection works: tell the user it is set up and stop. Do not run the checks below, do not ask for anything else and do not add caveats about other clients. Go on only if the tool is missing or the call fails.
 
 ## Option 1: installer (recommended, easier)
-1. Ask whether the user has the installer (`install.ps1`, from the project's `installer` folder) and where. If not, suggest getting it from https://github.com/Matheus-Bertol/claude-salesforce-bridge (Code > Download ZIP), or, with the user's OK, download the single file:
-   `Invoke-WebRequest https://raw.githubusercontent.com/Matheus-Bertol/claude-salesforce-bridge/main/installer/install.ps1 -OutFile "$env:USERPROFILE\Downloads\claude-salesforce-bridge\install.ps1"` (create the folder first).
-2. Run (`<name>` with or without the `salesforce-conector-` prefix; prefix each with `powershell -ExecutionPolicy Bypass -File "<path>\install.ps1"`):
+1. Get the installer path (`<path>` below):
+   - **You can run commands on the user's Windows computer (Claude Code):** `<path>` is the full path of the bundled `scripts\install.ps1` in this skill's folder. Use it where it is and run the options below yourself.
+   - **You cannot (claude.ai and similar):** give the bundled `scripts/install.ps1` to the user as a file to download (do not paste its content in the chat). Ask them to save it, for example in `Downloads`; `<path>` is where they saved it. The user runs the options below in a normal PowerShell or CMD window (without `-Json`) and tells you the result.
+2. Options (`<name>` with or without the `salesforce-conector-` prefix; prefix each with `powershell -ExecutionPolicy Bypass -File "<path>\install.ps1"`):
    - `-List -Json`: every connection with place, config file, URL, port, `--host localhost` and saved login.
    - `-Check <name> -Json`: entry, Node.js, mcp-remote, port and saved login; any `error` means a problem.
    - Only after telling the user the browser may open: `-Check <name> -Test -Json` (signs in, lists tools, `hints` on failure).

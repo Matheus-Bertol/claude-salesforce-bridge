@@ -7,7 +7,8 @@ description: Install, guide the installation of, or remove a Claude Salesforce B
 ## Rules
 - Never guess values; ask the user. Never ask for a Consumer Secret (public client with PKCE). Do not echo the full Consumer Key.
 - Recommend the installer first. Offer the manual path only if the user cannot or does not want to use it, and say it is more complex and easier to get wrong.
-- Ask before downloading anything. Do not close Claude Desktop yourself.
+- The installer is bundled with this skill: `scripts/install.ps1`, in the same folder as this `SKILL.md`. Use that file; do not download it from anywhere else and do not edit it.
+- Do not close Claude Desktop yourself.
 - On any error, use `salesforce-bridge-check`.
 
 ## Prerequisites (check first)
@@ -15,19 +16,19 @@ description: Install, guide the installation of, or remove a Claude Salesforce B
 - From the Salesforce admin: **Server URL** (Setup > MCP Servers) and **Consumer Key** of the External Client App, with Callback URL `http://localhost:<port>/oauth/callback` (default port `8080`), PKCE on, JWT-based access tokens on, no secret required.
 
 ## Option 1: installer (recommended, easier)
-1. Ask whether the user already has the installer (`install.ps1`, from the project's `installer` folder) and where. If not, suggest getting it from GitHub:
-   - Repository: https://github.com/Matheus-Bertol/claude-salesforce-bridge (Code > Download ZIP, extract, use `installer\`).
-   - Or, with the user's OK, download the single file yourself to `%USERPROFILE%\Downloads\claude-salesforce-bridge\install.ps1`:
-     `Invoke-WebRequest https://raw.githubusercontent.com/Matheus-Bertol/claude-salesforce-bridge/main/installer/install.ps1 -OutFile "$env:USERPROFILE\Downloads\claude-salesforce-bridge\install.ps1"` (create the folder first).
+1. Get the installer path (`<path>` below):
+   - **You can run commands on the user's Windows computer (Claude Code):** `<path>` is the full path of the bundled `scripts\install.ps1` in this skill's folder. Use it where it is.
+   - **You cannot (claude.ai and similar):** give the bundled `scripts/install.ps1` to the user as a file to download (do not paste its content in the chat). Ask them to save it, for example in `Downloads`; `<path>` is where they saved it.
 2. Ask for the values: **Name** (saved as `salesforce-conector-<name>`; lowercase letters, digits, single hyphens, max 40), **Server URL**, **Consumer Key**, **Port** (Enter = `8080`).
-3. The installer is interactive, so the user runs it in a normal PowerShell or CMD window (not inside Claude). Give them the command with the values filled in, so it only asks Y/N questions:
+3. Installing is interactive, so the user always runs it in a normal PowerShell or CMD window (not inside Claude). Give them the command with the values filled in, so it only asks Y/N questions:
    `powershell -ExecutionPolicy Bypass -File "<path>\install.ps1" -Name <name> -ServerUrl "<url>" -ConsumerKey "<key>" -Port <port>`
    It checks Node.js, installs `mcp-remote` locally, saves the connector in every Claude Code / Claude Desktop config it finds, asks before closing Claude Desktop, and offers the browser sign-in at the end. To edit a connection, run it again with the same name.
 4. When the user is done, go to **Confirm it works**.
 
-Remove with the installer (you may run these yourself): first the dry run
+Remove with the installer: first the dry run
 `powershell -ExecutionPolicy Bypass -File "<path>\install.ps1" -Remove <name> -Json`, show what would change, and only after the user says yes:
 `... -Remove <name> -From code|desktop|all -Yes -Json`.
+Run these yourself when you can run commands on the user's computer; otherwise the user runs them and tells you the result.
 
 ## Option 2: manual (no installer, more complex)
 Warn the user that this path has more steps and is easier to get wrong. Before writing any config: user confirms, Claude Desktop fully closed (including tray icon), backup `<file>.bak-<yyyyMMdd-HHmmss>` made. Change only the connector key.
