@@ -30,52 +30,69 @@ Done once by a Salesforce admin.
 
 ## Client-side setup
 
-Done on each user's machine. Use the installer, or follow the manual steps.
+Done on each user's machine. **Use the installer** (recommended): it does every step below for you. If you prefer to do it by hand, follow [Manual setup](#manual-setup-without-the-installer); those steps still work.
 
 For Claude Desktop, you can also let Claude do the setup for you: paste [fast-install-prompt.md](fast-install-prompt.md) into Claude Code (or any Claude that can run commands on your computer). Claude asks for each value and edits the config file.
 
-### Installer (beta)
+### Installer (recommended)
 
-1. Install [Node.js LTS](https://nodejs.org).
-2. Close Claude completely, including the system tray icon. Claude rewrites its config files and may overwrite the changes. The installer warns you if Claude is still running.
-3. Run `installer\install.cmd` (double-click it, or run it from a terminal). Keep `install.cmd` and `installer.js` in the same folder.
-4. Choose **Configure connection → Create** and enter:
+The installer is `installer\install.ps1` (beta). Double-click `installer\install.cmd` (it only starts `install.ps1` from the same folder), or run it from a normal PowerShell or CMD window (not from inside Claude):
+
+```
+powershell -ExecutionPolicy Bypass -File installer\install.ps1
+```
+
+Before it starts, it checks this computer:
+
+- **Node.js 20 or newer.** If Node.js is missing, it offers to install Node.js LTS with `winget` (Windows may ask for permission). Without `winget`, install it from [nodejs.org](https://nodejs.org).
+- **mcp-remote** is installed once, with a fixed version, in `%LOCALAPPDATA%\ClaudeSalesforceBridge\ponte`. New connectors run `node.exe` by its full path with that copy, so they do not depend on `PATH` or on `npx` downloading the package each time Claude starts. If the local install fails, the connector falls back to `npx`.
+- **Claude Desktop** rewrites its config file when it closes, so it must be closed while saving. If it is open, the installer asks before closing it (or offers to save only in Claude Code); nothing is closed without your confirmation. When the installer ends, it reopens Claude Desktop if it was closed during the run (`-NoRestart` skips this).
+
+**Preconfigured installer.** To hand out an installer with your org's values, fill the "adjust here" block at the top of `install.ps1` (`Name`, `ServerUrl`, `ConsumerKey`, `Port`). Filled values are used in **Create** without asking; empty ones are asked. The same values can be passed as parameters (`-Name`, `-ServerUrl`, `-ConsumerKey`, `-Port`), which win over the block.
+
+The installer runs in a straight line, with no menus:
+
+1. Run the installer as shown above. It shows every `salesforce-conector-*` connection with its live status (**CONNECTED**, **LOGIN EXPIRED**, **NOT SIGNED IN** or **ERROR**), checked with Salesforce using the saved login, without opening the browser. For an expired or missing login it offers to sign in again (it clears that connection's saved login and opens the browser), because the token cannot be renewed automatically.
+2. Answer **Y** to install a connection and enter (fields already filled in the "adjust here" block are skipped):
    - **Connection name:** saved as `salesforce-conector-<name>`.
    - **Server URL** and **Consumer Key** from the Salesforce-side setup.
    - **Callback port:** `8080` by default. It must match the Callback URL in the External Client App.
 
-   The installer finds where Claude is installed and saves the connector in every place it finds: Claude Code (`%USERPROFILE%\.claude.json`, when it exists) and Claude Desktop (`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json` for the packaged (MSIX) version, the tested one; otherwise `%APPDATA%\Claude\claude_desktop_config.json`). The review screen lists the files before saving.
+   The installer finds where Claude is installed and saves the connector in every place it finds: Claude Code (`%USERPROFILE%\.claude.json`, when it exists) and every Claude Desktop config location, because Desktop reads a different file depending on how it was installed: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\` (packaged/MSIX version, the tested one; the file is created if missing), `%APPDATA%\Claude\` and `%LOCALAPPDATA%\Claude-Data\claude_*\`. Only the connector entry is added; the rest of each file is kept, and the same physical file is written once. The summary lists the files before saving.
 
    In any field, press **Esc** or type `back` (or `cancel`) to go back one step; when a field already has a value, Enter keeps it. Pasted values are trimmed and surrounding quotes are removed.
-5. Review the values and choose **Save**. Each config file is backed up next to itself as `<file>.bak-<date>` before it is changed. Saving is all or nothing: if one file fails, the files already saved are restored from their backups. If a connector with the same name already exists in a destination, the installer asks before replacing it (default: no).
-6. Choose **Sign in and test the connection now**. The browser opens the Salesforce login; after you sign in, the installer lists the available tools. The token is saved in `%USERPROFILE%\.mcp-auth` and reused by Claude.
-7. Open Claude. `salesforce-conector-<name>` should be listed under MCP servers (Claude Code) or Settings → Developer (Claude Desktop). If it shows a warning, click **Reconnect**.
+3. Check the summary and answer **Y** to save. No backup files are created. Saving is all or nothing: if one file fails, the files already saved are put back as they were. If a connector with the same name already exists, the installer asks before replacing it (default: no). If Claude Desktop is open, it asks to close it first.
+4. Answer **Y** to sign in and test the connection. The browser opens the Salesforce login; after you sign in, the installer lists the available tools. The token is saved in `%USERPROFILE%\.mcp-auth` and reused by Claude.
+5. Open Claude. `salesforce-conector-<name>` should be listed under MCP servers (Claude Code) or Settings → Developer (Claude Desktop). If it shows a warning, click **Reconnect**.
 
-**Check installations** lists every `salesforce-conector-*` connection found in the Claude Code and Claude Desktop config files. From there you can open one (details, sign-in test, open the config file in Notepad, **Remove**) or edit it. **Remove** deletes only that connector entry (from one or more places, if it exists in several), after a confirmation and a `.bak` backup of each file; the rest of the file is kept. Connections with other names are not listed, so use `salesforce-conector-<name>` in the manual steps below too.
+To edit a connection, run the installer again with the same name (it replaces it). Checking, removing and clearing the login are done with the command-line options below. Only `salesforce-conector-*` connections are handled, so use `salesforce-conector-<name>` in the manual steps below too.
 
 #### Command-line mode
 
 With options, the installer runs without the menu, for scripts and agents:
 
 ```
-installer\install.cmd --help
-installer\install.cmd --version
-installer\install.cmd --list [--json]
-installer\install.cmd --check <name> [--test] [--json]
-installer\install.cmd --remove <name> --from code|desktop|all --yes [--json]
-installer\install.cmd --clear-login <name> --yes [--json]
+powershell -ExecutionPolicy Bypass -File installer\install.ps1 -Help
+powershell -ExecutionPolicy Bypass -File installer\install.ps1 -Version
+powershell -ExecutionPolicy Bypass -File installer\install.ps1 -List [-Json]
+powershell -ExecutionPolicy Bypass -File installer\install.ps1 -Check <name> [-Test] [-Json]
+powershell -ExecutionPolicy Bypass -File installer\install.ps1 -Remove <name> -From code|desktop|all -Yes [-Json]
+powershell -ExecutionPolicy Bypass -File installer\install.ps1 -ClearLogin <name> -Yes [-Json]
 ```
 
 - `<name>` can be given with or without the `salesforce-conector-` prefix.
-- `--list` shows each connection with its place, config file, Server URL, port, `--host localhost` and whether a login is saved.
-- `--check` checks the entry, Node.js/npx, the port and the saved login. `--test` also signs in (the browser may open) and lists the tools.
-- `--remove` needs `--from` with `--yes`; `code` and `all` include every Claude Code project.
-- `--clear-login` moves only that connection's login files to a `backup-<date>` folder inside `%USERPROFILE%\.mcp-auth`. Connections with the same Server URL share the login.
-- Without `--yes`, `--remove` and `--clear-login` only show what they would do and change nothing.
-- `--json` prints machine-readable output.
-- Exit codes: `0` ok, `1` problem found or action failed, `2` usage error (including a missing `--yes`).
+- `-List` shows each connection with its place, config file, Server URL, port, `--host localhost` and whether a login is saved.
+- `-Check` checks the entry, Node.js, mcp-remote (local copy or npx), the port and the saved login. `-Test` also signs in (the browser may open) and lists the tools.
+- `-Remove` needs `-From` with `-Yes`; `code` and `all` include every Claude Code project.
+- `-ClearLogin` moves only that connection's login files to a `backup-<date>` folder inside `%USERPROFILE%\.mcp-auth`. Connections with the same Server URL share the login.
+- Without `-Yes`, `-Remove` and `-ClearLogin` only show what they would do and change nothing.
+- `-Json` prints machine-readable output.
+- Command-line mode does not install Node.js or mcp-remote and does not close or reopen Claude Desktop.
+- Exit codes: `0` ok, `1` problem found or action failed, `2` usage error (including a missing `-Yes`).
 
-### Manual setup
+### Manual setup (without the installer)
+
+Use these steps if you do not want to run the installer. Connectors set up this way use `npx`, and the installer still recognizes them.
 
 1. Install [Node.js LTS](https://nodejs.org) and check it in a terminal: `node -v` and `npx -v`.
 2. Sign in once from a terminal before configuring Claude (see [TESTING.md](TESTING.md), section 2). Claude stops a server that takes longer than about 30 seconds to start, which is not enough time to sign in through the browser. The token is saved in `%USERPROFILE%\.mcp-auth` and reused by Claude.
@@ -123,6 +140,7 @@ Test checklist: [TESTING.md](TESTING.md).
 
 - **`redirect_uri_mismatch`:** the `redirect_uri` sent does not match the Callback URL. Run with `--debug` and look for `redirect_uri=` in the log. If it shows `127.0.0.1`, add `"--host", "localhost"` to `args`.
 - **`401 Invalid token`, or `scope parameter not supported` in the `mcp-remote` log:** JWT-based access tokens are not enabled in the External Client App. Enable them, delete `%USERPROFILE%\.mcp-auth` and sign in again.
+- **`ERR_SSL_PROTOCOL_ERROR` on `https://localhost:<port>/oauth/callback` after signing in:** the sign-in callback must be `http`, not `https`. Change `https://` to `http://` in the address bar and press Enter (the code is still valid for a few minutes). Then check that the Callback URL in the External Client App starts with `http://`; if it does, the browser forced HTTPS: clear the HSTS rule for `localhost` at `edge://net-internals/#hsts` (or `chrome://net-internals/#hsts`) → "Delete domain security policies".
 - **`404 Server definition not found`:** the URL is not the Server URL from Setup → MCP Servers, or the server is not active.
 - **Sign-in page never appears when starting from Claude:** sign in from a terminal first (Client-side setup, step 2), then click Reconnect.
 - **Browser opens and closes immediately:** expected when you are already signed in to the org. Sign-in succeeded.
@@ -130,18 +148,19 @@ Test checklist: [TESTING.md](TESTING.md).
 - **Port 8080 in use:** usually an old `mcp-remote` process. Find it with `netstat -ano | findstr :8080` and end that `node.exe`. If you change the port, update the Callback URL too.
 - **Quotes in the `client_id` JSON break:** copy `config/oauth_client_info.example.json` to `config/oauth_client_info.json`, fill it in, and replace that argument with `"@C:\\path\\to\\config\\oauth_client_info.json"`.
 - **Claude cannot find `npx`:** use `"command": "cmd"` and start `args` with `"/c", "npx"`.
-- **Stuck sign-in or invalid token:** delete `%USERPROFILE%\.mcp-auth` and restart Claude. To affect only one connection instead, run `installer\install.cmd --clear-login <name> --yes`.
+- **Stuck sign-in or invalid token:** delete `%USERPROFILE%\.mcp-auth` and restart Claude. To affect only one connection instead, run `powershell -ExecutionPolicy Bypass -File installer\install.ps1 -ClearLogin <name> -Yes`.
 - **Logs:** add `"--debug"` to `args`. The log is written to `%USERPROFILE%\.mcp-auth\<hash>_debug.log`.
 
 ## Known limitations
 
 - **Tested environment:** Windows only, with Claude Code and the packaged (MSIX) Claude Desktop. See the note at the top.
+- **Node.js path:** connectors saved by the installer point to `node.exe` by its full path. If Node.js is moved or reinstalled in another folder, run the installer again and edit (or recreate) the connection.
 
 - **Token renewal:** Salesforce does not return `expires_in`, and `mcp-remote` sends `scope` on refresh, which Salesforce rejects. When the token expires, delete `%USERPROFILE%\.mcp-auth` and sign in again.
 
 ## Roadmap
 
-- **Installer:** available as a beta in `installer/` (see [Installer (beta)](#installer-beta)). It checks Node.js, asks for the Server URL and Consumer Key, backs up and updates `%USERPROFILE%\.claude.json` and `claude_desktop_config.json`, runs the first sign-in and checks the connection. It also removes connections, clears the saved login of one connection, and has a command-line mode (`--list`, `--check`, `--remove`, `--clear-login`, `--json`). Next: a stable release.
+- **Installer:** available as a beta, `installer/install.ps1` (see [Installer (recommended)](#installer-recommended)). It checks or installs Node.js, installs a fixed mcp-remote version locally, shows the live status of each connection, asks for the Server URL and Consumer Key (or takes them from its "adjust here" block), updates `%USERPROFILE%\.claude.json` and every `claude_desktop_config.json`, runs the first sign-in and checks the connection. It also removes connections, clears the saved login of one connection, and has a command-line mode (`-List`, `-Check`, `-Remove`, `-ClearLogin`, `-Json`). Next: a stable release.
 - **Other Salesforce MCP servers:** test servers beyond `sobject-reads`, such as record updates, running Flows and calling Agentforce agents.
 - **Data dictionary:** context that maps the words users actually use to the org's data model, so Claude picks the right object and field:
   - synonyms, abbreviations and internal terms used by each team, mapped to objects and fields;
