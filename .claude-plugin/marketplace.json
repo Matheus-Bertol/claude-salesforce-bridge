@@ -1,0 +1,14 @@
+{
+  "name": "salesforce-bridge",
+  "owner": {
+    "name": "Matheus Bertol",
+    "url": "https://github.com/Matheus-Bertol"
+  },
+  "plugins": [
+    {
+      "name": "salesforce-bridge",
+      "source": "./",
+      "description": "Skills and agents to install, check and remove Salesforce Hosted MCP connections (salesforce-conector-*) in Claude Code and Claude Desktop on Windows."
+    }
+  ]
+}

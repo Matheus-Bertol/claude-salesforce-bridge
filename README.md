@@ -90,6 +90,24 @@ powershell -ExecutionPolicy Bypass -File installer\install.ps1 -ClearLogin <name
 - Command-line mode does not install Node.js or mcp-remote and does not close or reopen Claude Desktop.
 - Exit codes: `0` ok, `1` problem found or action failed, `2` usage error (including a missing `-Yes`).
 
+### Claude Code plugin and claude.ai skills
+
+The repository is also a Claude Code plugin: two skills (`salesforce-bridge-install`, `salesforce-bridge-check`) and two agents (`salesforce-bridge-setup`, `salesforce-bridge-doctor`) that guide the install, check and removal of a connection. Each skill carries its own copy of the installer in `scripts\install.ps1`, so nothing else has to be downloaded.
+
+- **Claude Code:** add the marketplace and install the plugin:
+
+  ```
+  /plugin marketplace add Matheus-Bertol/claude-salesforce-bridge
+  /plugin install salesforce-bridge@salesforce-bridge
+  ```
+
+  Then ask Claude to install or check the Salesforce connector. Installing is still done by you in a normal terminal: Claude gives you the command.
+- **claude.ai:** compress one skill folder (`skills\salesforce-bridge-install` or `skills\salesforce-bridge-check`, including its `scripts` folder) into a ZIP and upload it as a skill in the settings. Claude hands you the bundled `install.ps1` to download and run.
+
+The agents only work in Claude Code; on claude.ai only the skills are available.
+
+> **Maintainers:** `skills\salesforce-bridge-install\scripts\install.ps1` and `skills\salesforce-bridge-check\scripts\install.ps1` are exact copies of `installer\install.ps1`. Copy the file again to both folders whenever `installer\install.ps1` changes, and keep the "adjust here" block empty in the copies.
+
 ### Manual setup (without the installer)
 
 Use these steps if you do not want to run the installer. Connectors set up this way use `npx`, and the installer still recognizes them.
