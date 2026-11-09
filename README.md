@@ -92,7 +92,7 @@ powershell -ExecutionPolicy Bypass -File installer\install.ps1 -ClearLogin <name
 
 ### Claude Code plugin and claude.ai skills
 
-The repository is also a Claude Code plugin: two skills (`salesforce-bridge-install`, `salesforce-bridge-check`) and two agents (`salesforce-bridge-setup`, `salesforce-bridge-doctor`) that guide the install, check and removal of a connection. Each skill carries its own copy of the installer in `scripts\install.ps1`, so nothing else has to be downloaded.
+The repository is also a Claude Code plugin: the skills in `skills\` (`salesforce-bridge-install`, `salesforce-bridge-check`, `salesforce-bridge-usage`, `salesforce-bridge-org-setup`) and two agents (`salesforce-bridge-setup`, `salesforce-bridge-doctor`) that follow the install and check skills. Each skill is a single self-contained `SKILL.md`: Claude does the steps itself, with no installer and nothing to download.
 
 - **Claude Code:** add the marketplace and install the plugin:
 
@@ -101,12 +101,10 @@ The repository is also a Claude Code plugin: two skills (`salesforce-bridge-inst
   /plugin install salesforce-bridge@salesforce-bridge
   ```
 
-  Then ask Claude to install or check the Salesforce connector. Installing is still done by you in a normal terminal: Claude gives you the command.
-- **claude.ai:** compress one skill folder (`skills\salesforce-bridge-install` or `skills\salesforce-bridge-check`, including its `scripts` folder) into a ZIP and upload it as a skill in the settings. Claude hands you the bundled `install.ps1` to download and run.
+  Then ask Claude to install or check the Salesforce connector. Claude shows what it will write and asks before saving; the browser sign-in is still done by you in a normal terminal, with the command Claude gives you.
+- **claude.ai:** compress one skill folder (for example `skills\salesforce-bridge-install`) into a ZIP and upload it as a skill in the settings. There Claude cannot run commands on your computer, so it guides you through the steps.
 
 The agents only work in Claude Code; on claude.ai only the skills are available.
-
-> **Maintainers:** `skills\salesforce-bridge-install\scripts\install.ps1` and `skills\salesforce-bridge-check\scripts\install.ps1` are exact copies of `installer\install.ps1`. Copy the file again to both folders whenever `installer\install.ps1` changes, and keep the "adjust here" block empty in the copies.
 
 ### Manual setup (without the installer)
 
